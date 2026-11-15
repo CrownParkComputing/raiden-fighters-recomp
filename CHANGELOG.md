@@ -5,9 +5,13 @@
 - Preserve queued NGS2 PCM blocks and dispatch block-end callbacks so the game
   can refill its three staging buffers continuously.
 - Keep callback refill outside the graph lock and suppress stale reset/stop
-  events. Add native and FEX-dispatch streaming regression checks.
+  events. Add native streaming regression checks and a FEX callback-dispatch fixture.
 - Verify real guest refill callbacks and sustained non-silent PCM output during
   an 80-second native run, with normal Exit completing successfully.
+- Reach player stages in all three games on Linux, with 60 FPS in steady
+  sections, and document the separate Options/Start presses needed after boot.
+- Install Android version 0.2/code 2 with verified SD-card data and APK hashes;
+  the device gameplay check remains pending.
 
 ## 0.1 — 2026-11-15
 

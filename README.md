@@ -5,8 +5,9 @@ using the shared Tempest, PAC-MAN CE2, Akka Arrh and Polybius runtime.
 
 The collection includes Raiden Fighters, Raiden Fighters 2 and Raiden Fighters
 Jet, with Japanese and US variants. The supplied matching base and update have
-been inspected; the executable and bundled libraries prepare and link. Linux renders the original title, game selection and arcade attract sequence
-at 60 FPS in steady sections. Raiden Fighters reaches a playable mission; sustained PCM streaming is verified.
+been inspected; the executable and bundled libraries prepare and link. Linux
+reaches player stages in all three games, with 60 FPS in steady sections and
+sustained PCM audio. These are initial gameplay checks, not full playthroughs.
 Android device runtime verification is pending. See the
 [current status](docs/raiden-fighters-port-status.md) for verified behavior.
 

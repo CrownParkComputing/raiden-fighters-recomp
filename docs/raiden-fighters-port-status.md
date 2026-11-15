@@ -31,9 +31,17 @@ Draw recording and preparation retain the serial defaults verified in Akka.
 
 Linux boots the original collection title, game-selection menu and Arcade Mode
 menu, and renders the original arcade attract sequence with side artwork.
-Steady sections run at 60 FPS, with brief compilation/loading pauses. Raiden Fighters reaches a playable mission and game-over/continue flow.
-Options/Start starts player 1 once the original arcade boot has reached its
-credits/start prompt; early presses during boot can be ignored.
+Steady sections run at 60 FPS, with brief compilation/loading pauses. Player
+stages have been reached in Raiden Fighters, Raiden Fighters 2 and Raiden
+Fighters Jet. Raiden Fighters also reached game-over/continue flow. These checks
+do not cover every regional variant, level or retry path.
+
+The verified start sequence uses separate Options/Start presses: one after
+arcade boot reaches INSERT COIN, then another at the credits/player-start
+prompt to start player 1. Release between presses; early presses during boot
+can be ignored. Cross/A confirms fighter/name selection and shoots. See the
+[first-start instructions](building.md#first-start).
+
 The original NGS2 adapter replaced each submitted PCM block and did not deliver
 block-end callbacks, leaving only the last short staging block. The corrected
 queue preserves the three buffers, combines logical windows with their appended
@@ -57,14 +65,16 @@ in the public source tree.
 ## Build and installation checks
 
 The native runtime/renderer checks pass, including streaming callback order, reset/stop
-invalidation, native/FEX dispatch, extraction, thread cleanup
+invalidation, native dispatch and the FEX callback-dispatch fixture, extraction, thread cleanup
 and cancellation, case-sensitive save isolation, and decoder error/lifecycle
 checks. Python checks pass 92 tests with 17 optional skips. Driver ZIP fixtures
 pass. Android main, boot-check and FEX-check targets build, and APK signing,
 manifest, ARM64 libraries, launcher icon and bundled-driver provenance pass.
 
 The separate app is installed on the Retroid. Its full 5,174-file game tree is
-staged in its own SD-card external-files directory, with all sizes checked.
+staged in its own SD-card external-files directory, with all sizes checked and
+the prepared-image, executable and SFO hashes matched against the host.
+The installed APK is version 0.2/code 2 and its hash matches the signed build.
 Settings, logs and saves stay in primary storage. Device launch is awaiting the
 user's availability so the existing foreground app can remain undisturbed.
 

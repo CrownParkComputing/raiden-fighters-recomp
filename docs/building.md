@@ -106,10 +106,16 @@ L3 + R3 opens Settings; F10 and holding Select for two seconds also work.
 
 ## First start
 
-Use the original collection menu to choose a game. Cross/A confirms and
-Circle/B returns. After Arcade Mode starts, wait for the original arcade boot
-to reach its credits/start prompt, then press Options/Start for player 1.
-Cross/A selects the fighter and shoots. L3+R3 opens the port Settings menu; F10 also opens it on Linux.
+The collection can boot into arcade attract mode. Press Options/Start to open
+the collection frontend, then use its original menus to choose a game and
+Arcade Mode. Cross/A confirms and Circle/B returns.
+
+After starting Arcade Mode, wait for the original arcade boot to reach INSERT
+COIN. In the verified sequence, one Options/Start press makes credits available;
+a second fresh press at the credits/player-start prompt starts player 1.
+Release between presses. Early presses during boot can be ignored.
+Cross/A confirms fighter/name selection and shoots. L3+R3 opens the port
+Settings menu; F10 also opens it on Linux.
 Keep a separate profile while testing a new executable or runtime version.
 
 ## Android

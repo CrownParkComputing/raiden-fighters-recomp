@@ -65,7 +65,7 @@ The reused FEX source must be revision
 script checks those conditions and refuses to modify a read-only checkout.
 Build output belongs to this port's own `out/android-fex-ndk`.
 
-After the runtime/API and audio-decoder integration is complete:
+Build the runtime and headless check targets:
 
 ```bash
 bash tools/build_android_fex.sh --ndk
@@ -73,7 +73,7 @@ bash tools/build_android_fex.sh --ndk
 
 This builds `main`, `tempest-fex-check` and `tempest-boot-check`. Generated FEX
 adapters must include newly added runtime modules. Do not reuse another port's
-`libmain.so` or build directory. Coordinate source-list changes before building.
+`libmain.so` or build directory.
 
 ## Driver and APK
 
