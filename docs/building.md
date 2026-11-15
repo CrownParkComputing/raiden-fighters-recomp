@@ -107,7 +107,9 @@ L3 + R3 opens Settings; F10 and holding Select for two seconds also work.
 ## First start
 
 Use the original collection menu to choose a game. Cross/A confirms and
-Circle/B returns. L3+R3 opens the port Settings menu; F10 also opens it on Linux.
+Circle/B returns. After Arcade Mode starts, wait for the original arcade boot
+to reach its credits/start prompt, then press Options/Start for player 1.
+Cross/A selects the fighter and shoots. L3+R3 opens the port Settings menu; F10 also opens it on Linux.
 Keep a separate profile while testing a new executable or runtime version.
 
 ## Android

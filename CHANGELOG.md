@@ -1,5 +1,14 @@
 # Raiden Fighters Remix Collection port changes
 
+## 0.2 — 2026-11-15
+
+- Preserve queued NGS2 PCM blocks and dispatch block-end callbacks so the game
+  can refill its three staging buffers continuously.
+- Keep callback refill outside the graph lock and suppress stale reset/stop
+  events. Add native and FEX-dispatch streaming regression checks.
+- Verify real guest refill callbacks and sustained non-silent PCM output during
+  an 80-second native run, with normal Exit completing successfully.
+
 ## 0.1 — 2026-11-15
 
 - Start the separate CUSA53688 v1.20 Linux and Android port, retaining shared

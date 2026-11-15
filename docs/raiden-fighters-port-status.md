@@ -31,9 +31,15 @@ Draw recording and preparation retain the serial defaults verified in Akka.
 
 Linux boots the original collection title, game-selection menu and Arcade Mode
 menu, and renders the original arcade attract sequence with side artwork.
-Steady sections run at 60 FPS, with brief compilation/loading pauses. Player
-credit/start controls and sustained gameplay audio remain under verification.
-Non-silent output is captured from the AudioOut path; the independent Audiodec
+Steady sections run at 60 FPS, with brief compilation/loading pauses. Raiden Fighters reaches a playable mission and game-over/continue flow.
+Options/Start starts player 1 once the original arcade boot has reached its
+credits/start prompt; early presses during boot can be ignored.
+The original NGS2 adapter replaced each submitted PCM block and did not deliver
+block-end callbacks, leaving only the last short staging block. The corrected
+queue preserves the three buffers, combines logical windows with their appended
+data, and dispatches real guest callbacks so the game can refill them.
+An 80-second run delivered 1,945 callbacks and 4,311 audible buffers out of 7,500,
+then exited normally. PCM samples are finite. The independent Audiodec
 regression decodes real hand-authored ATRAC9 input into nonzero PCM.
 
 A separate profile creates SaveData/savedata.bin and trophy_stats.bin. Longer
@@ -50,7 +56,8 @@ in the public source tree.
 
 ## Build and installation checks
 
-The native runtime/renderer checks pass, including extraction, thread cleanup
+The native runtime/renderer checks pass, including streaming callback order, reset/stop
+invalidation, native/FEX dispatch, extraction, thread cleanup
 and cancellation, case-sensitive save isolation, and decoder error/lifecycle
 checks. Python checks pass 92 tests with 17 optional skips. Driver ZIP fixtures
 pass. Android main, boot-check and FEX-check targets build, and APK signing,

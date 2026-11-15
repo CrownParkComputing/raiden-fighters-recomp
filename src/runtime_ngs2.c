@@ -10,10 +10,12 @@
  * codes; the game's own allocator is not called, because its handlers are guest code and nothing
  * here needs the memory to come from the guest's pool. */
 #include "runtime.h"
+#include "guest_call.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#include <pthread.h>
 #include "libatrac9.h"
 
 #define ERR_INVALID_OUT_ADDRESS ((int32_t)0x804A0053)
@@ -24,6 +26,11 @@
 #define ERR_INVALID_VOICE_HANDLE ((int32_t)0x804A0300)
 #define ERR_INVALID_VOICE_INDEX ((int32_t)0x804A0302)
 #define ERR_OUT_OF_MEMORY ((int32_t)0x804A0004)
+#define ERR_INVALID_PARAM_ADDRESS ((int32_t)0x804A0309)
+#define ERR_INVALID_PARAM_SIZE ((int32_t)0x804A030A)
+#define ERR_INVALID_BLOCK_COUNT ((int32_t)0x804A0151)
+#define ERR_INVALID_BLOCK_ADDRESS ((int32_t)0x804A0154)
+#define ERR_INVALID_CALLBACK_FLAG ((int32_t)0x804A030D)
 
 /* The PS4 hands a rack as many voices as its option asks for; without an option it is this many,
  * which is what the sampler rack defaults to. */
@@ -42,6 +49,20 @@ typedef struct { uint16_t size; int16_t next; uint32_t id; } VoiceParamHeader;
 /* The format of a voice's sample data, and one block of it. Both follow shadPS4's ngs2.h. */
 typedef struct { uint32_t type, channels, sample_rate, config, frame_offset, frame_margin; } WaveformFormat;
 typedef struct { uint32_t data_offset, data_size, repeats, skip_samples, samples, reserved; uintptr_t user_data; } WaveformBlock;
+_Static_assert(sizeof(WaveformBlock) == 32, "PS4 waveform blocks use 32-bit byte offsets");
+typedef struct {
+    uintptr_t callback_data;
+    void *voice;
+    uint32_t flag, reserved;
+    uintptr_t user_data;
+    const void *data;
+    uint32_t data_size, repeated, attributes, reserved2;
+} VoiceCallbackInfo;
+_Static_assert(sizeof(VoiceCallbackInfo) == 56, "PS4 callback info ABI");
+typedef void (ABI *VoiceCallback)(const VoiceCallbackInfo *);
+enum { BLOCK_CONTINUE=1, BLOCK_APPEND=2, BLOCK_RESET=4, BLOCK_SILENCE=0x10,
+       CALLBACK_BLOCK_END=1, CALLBACK_BLOCK_REPEAT=2, MAX_BLOCKS=4096 };
+typedef struct { WaveformBlock info; const unsigned char *data; int silence; } QueuedBlock;
 /* A voice parameter's id is (rack id << 16) | index, so the same parameter has a different id
  * on each kind of rack. The constants below follow AnyPS5's libSceNgs2.native (GPL-2.0),
  * whose NGS2 is a working native implementation.
@@ -100,7 +121,12 @@ struct Voice {
     WaveformFormat format;     /* from PARAM_SAMPLER_SETUP */
     const unsigned char *data; /* from PARAM_SAMPLER_WAVEFORM_BLOCKS */
     uint32_t block_count;
-    WaveformBlock *blocks;     /* descriptors are caller scratch, so copy them at submission */
+    QueuedBlock *blocks;       /* descriptors are caller scratch; each queue entry owns its base */
+    int accepts_blocks;
+    VoiceCallback callback;
+    uintptr_t callback_data;
+    uint32_t callback_flags;
+    uint64_t generation;
     struct { Voice *dest; float volume; } ports[MAX_PORTS];
     uint32_t output_id;
     /* Decoding state: one ATRAC9 superframe is decoded at a time and handed out a grain at a
@@ -129,9 +155,15 @@ struct Voice {
 struct Rack { uint32_t magic; void *system; struct Rack *next; uint32_t voice_count, rack_id; Voice voices[]; };
 /* A system keeps its racks so rendering can walk every voice it owns. */
 typedef struct { uint32_t magic, sample_rate; Rack *racks; } System;
+/* Callbacks are dispatched after releasing this lock: Raiden's block-end handler calls
+ * VoiceControl again to refill the completed one of its three PCM staging buffers. */
+static pthread_mutex_t state_lock = PTHREAD_MUTEX_INITIALIZER;
+typedef struct { Voice *voice; uint64_t generation; VoiceCallbackInfo info; } PendingCallback;
+typedef struct { PendingCallback *items; size_t count, capacity; int32_t error; } RenderCallbacks;
 
 static size_t systems, racks, voices_handed, renders, rendered_bytes, decoded_frames, mixed_voices;
 static size_t pcm_plays, pcm_stops, pcm_ends, pcm_mixes;
+static size_t queued_blocks, delivered_callbacks;
 /* TEMPEST_NGS2_TRACE=1 logs every call and what it answered: Scream's own error messages name
  * only its source line, so the call that upset it has to be found from this side. */
 static int tracing(void) {
@@ -142,7 +174,7 @@ static int tracing(void) {
 #define TRACE(...) do { if (tracing()) fprintf(stderr,"NGS2: " __VA_ARGS__); } while (0)
 
 /* sceNgs2SystemCreateWithAllocator(option, allocator, outHandle): allocates the system handle. */
-static ABI int32_t system_create(const void *option, const void *allocator, void **out) {
+static int32_t system_create_locked(const void *option, const void *allocator, void **out) {
     (void)allocator;
     if (!out) return ERR_INVALID_OUT_ADDRESS;
     System *s = runtime_low_alloc(sizeof(*s));
@@ -165,7 +197,7 @@ static ABI int32_t system_create(const void *option, const void *allocator, void
 }
 /* sceNgs2SystemDestroy(handle, outBufferInfo): the buffer the system was built in is reported
  * back so the game can free it; this one allocated none, so the report is empty. */
-static ABI int32_t system_destroy(void *handle, ContextBufferInfo *out) {
+static int32_t system_destroy_locked(void *handle, ContextBufferInfo *out) {
     System *s = handle;
     if (!s || s->magic != SYSTEM_MAGIC) return ERR_INVALID_SYSTEM_HANDLE;
     s->magic = 0;
@@ -212,6 +244,80 @@ static void rewind_waveform(Voice *v) {
     start_decoder(v);
 }
 
+/* Logical windows and their encoded/PCM payload can arrive separately. In particular, RFD
+ * submits a zero-byte window declaring numSamples, followed by APPEND with that window's
+ * actual bytes. Preserve the window when extending its payload and retain each buffer base. */
+static int32_t queue_blocks(Voice *v, const void *data, uint32_t flags, uint32_t count,
+                            const WaveformBlock *blocks) {
+    if (count && !blocks) return ERR_INVALID_BLOCK_ADDRESS;
+    if (count > MAX_BLOCKS) return ERR_INVALID_BLOCK_COUNT;
+    int reset = (flags & BLOCK_RESET) || (v->state & VOICE_STATE_STOPPED);
+    uint32_t retained = reset ? 0 : v->block_count - v->block;
+    if (retained > MAX_BLOCKS - count) return ERR_INVALID_BLOCK_COUNT;
+    uint32_t capacity = retained + count, used = retained;
+    QueuedBlock *copy = capacity ? calloc(capacity, sizeof(*copy)) : NULL;
+    if (capacity && !copy) return ERR_OUT_OF_MEMORY;
+    if (retained) memcpy(copy, v->blocks + v->block, retained * sizeof(*copy));
+    for (uint32_t i = 0; i < count; ++i) {
+        WaveformBlock b;
+        memcpy(&b, blocks + i, sizeof(b));
+        if (!b.data_size && !b.samples) continue;
+        if (b.data_size && !data) { free(copy); return ERR_INVALID_BUFFER_ADDRESS; }
+        if ((uintptr_t)data > UINTPTR_MAX - b.data_offset ||
+            (uintptr_t)data + b.data_offset > UINTPTR_MAX - b.data_size) {
+            free(copy); return ERR_INVALID_BUFFER_ADDRESS;
+        }
+        const unsigned char *begin = data ? (const unsigned char *)data + b.data_offset : NULL;
+        if (flags & BLOCK_APPEND) {
+            if (!b.data_size) continue;
+            QueuedBlock *tail = used ? &copy[used - 1] : NULL;
+            /* A zero-byte window has not supplied its block userData yet. The APPEND piece
+             * supplies it, as in RFD's staging slots 1 and 2. Codec superframes remain separate. */
+            int joins = tail && (uintptr_t)tail->data + tail->info.data_size == (uintptr_t)begin &&
+                (!tail->info.data_size || tail->info.user_data == b.user_data) &&
+                (v->format.type != WAVEFORM_ATRAC9 || !tail->info.data_size ||
+                 !v->superframe_bytes || tail->info.data_size % v->superframe_bytes);
+            if (joins) {
+                if (tail->info.data_size > UINT32_MAX - b.data_size) {
+                    free(copy); return ERR_INVALID_BUFFER_ADDRESS;
+                }
+                if (!tail->info.data_size) tail->info.user_data = b.user_data;
+                tail->info.data_size += b.data_size;
+                tail->silence = 0;
+                continue;
+            }
+            b.repeats = b.skip_samples = b.samples = 0;
+        }
+        copy[used++] = (QueuedBlock){b, begin, !b.data_size && !!(flags & BLOCK_SILENCE)};
+    }
+    free(v->blocks);
+    v->blocks = copy; v->block_count = used; v->block = 0;
+    v->data = data;
+    v->accepts_blocks = !!(flags & BLOCK_CONTINUE);
+    if (reset) { ++v->generation; rewind_waveform(v); }
+    else if (!retained && !(flags & BLOCK_APPEND)) rewind_waveform(v);
+    else if (!v->source_ready) start_decoder(v);
+    if (!v->resample_current_valid) v->resample_started = 0;
+    v->state &= ~(VOICE_STATE_EMPTY | VOICE_STATE_STOPPED);
+    queued_blocks += count;
+    return 0;
+}
+
+static int callback_completed(Voice *v, const QueuedBlock *b, uint32_t flag,
+                               RenderCallbacks *events) {
+    if (!v->callback || !(v->callback_flags & flag)) return 1;
+    if (events->count == events->capacity) {
+        size_t capacity = events->capacity ? events->capacity * 2 : 8;
+        PendingCallback *copy = realloc(events->items, capacity * sizeof(*copy));
+        if (!copy) { events->error = ERR_OUT_OF_MEMORY; return 0; }
+        events->items = copy; events->capacity = capacity;
+    }
+    events->items[events->count++] = (PendingCallback){v, v->generation,
+        {v->callback_data, v, flag, 0, b->info.user_data, b->data,
+         b->info.data_size, v->repeated, 0, 0}};
+    return 1;
+}
+
 /* PCM is stored in waveform blocks without a codec handle. Read whole interleaved frames;
  * an incomplete final sample never borrows bytes from the following allocation. */
 static uint32_t pcm_decode(Voice *v, const unsigned char *at, uint32_t bytes) {
@@ -239,28 +345,34 @@ static uint32_t pcm_decode(Voice *v, const unsigned char *at, uint32_t bytes) {
 
 /* The next `want` samples a channel of a voice, decoded as needed, into `out` interleaved by
  * the voice's own channel count. Returns how many samples a channel were produced. */
-static uint32_t voice_samples(Voice *v, float *out, uint32_t want) {
-    if (!v->source_ready || !v->data || !v->blocks || v->block >= v->block_count) return 0;
+static uint32_t voice_samples(Voice *v, float *out, uint32_t want, RenderCallbacks *events) {
+    if (!v->source_ready || !v->blocks || v->block >= v->block_count) return 0;
     uint32_t done = 0;
-    while (done < want) {
+    while (done <= want) {
         if (v->block >= v->block_count) break;
-        const WaveformBlock *b = &v->blocks[v->block];
+        const QueuedBlock *queued = &v->blocks[v->block];
+        const WaveformBlock *b = &queued->info;
         if (!v->block_started) {
             v->skip_samples = b->skip_samples;
             v->remaining_samples = b->samples ? b->samples : UINT32_MAX;
             v->block_started = 1;
         }
+        /* An unfinished logical window is waiting for APPEND, rather than completed silence. */
+        if (!b->data_size && !queued->silence && b->samples && v->accepts_blocks) break;
         /* A sample window can finish inside the last decoded frame. Discard that tail before
          * deciding whether to repeat or advance; otherwise the voice gets stuck on take == 0. */
-        if (!v->remaining_samples || (v->read >= b->data_size && v->pcm_taken >= v->pcm_samples)) {
+        if (!v->remaining_samples || (!queued->silence && v->read >= b->data_size &&
+                                      v->pcm_taken >= v->pcm_samples)) {
             uint32_t frame_bytes = v->decode_channels *
                 ((v->format.type == WAVEFORM_PCM_I16_LE || v->format.type == WAVEFORM_PCM_I16_BE) ? 2 : 4);
             int can_repeat = b->data_size && (v->format.type == WAVEFORM_ATRAC9 ||
                                                b->data_size / frame_bytes > b->skip_samples);
             if (can_repeat && (b->repeats == UINT32_MAX || v->repeated < b->repeats)) {
                 if (b->repeats != UINT32_MAX) ++v->repeated;
+                if (!callback_completed(v, queued, CALLBACK_BLOCK_REPEAT, events)) break;
                 if (!start_decoder(v)) break;
             } else {
+                if (!callback_completed(v, queued, CALLBACK_BLOCK_END, events)) break;
                 ++v->block; v->repeated = 0;
             }
             v->read = 0; v->block_started = 0;
@@ -268,6 +380,7 @@ static uint32_t voice_samples(Voice *v, float *out, uint32_t want) {
             v->frame_index = v->input_cursor = 0;
             continue;
         }
+        if (done == want) break;
         if (v->pcm_taken < v->pcm_samples) {
             /* Drop the block's lead-in before anything is handed out. */
             if (v->skip_samples) {
@@ -289,7 +402,14 @@ static uint32_t voice_samples(Voice *v, float *out, uint32_t want) {
             continue;
         }
         /* Refill from the block that is playing; move on when it runs out. */
-        const unsigned char *at = v->data + b->data_offset + v->read;
+        if (queued->silence) {
+            uint32_t samples = v->remaining_samples;
+            if (samples > ATRAC9_MAX_SUPERFRAME) samples = ATRAC9_MAX_SUPERFRAME;
+            memset(v->pcm, 0, (size_t)samples * v->decode_channels * sizeof(float));
+            v->pcm_samples = samples; v->pcm_taken = 0;
+            continue;
+        }
+        const unsigned char *at = queued->data + v->read;
         if (v->format.type != WAVEFORM_ATRAC9) {
             v->pcm_samples = pcm_decode(v, at, b->data_size - v->read);
             v->pcm_taken = 0;
@@ -321,13 +441,14 @@ static uint32_t voice_samples(Voice *v, float *out, uint32_t want) {
 
 /* Sampler pitch is relative to format.sampleRate. Keep the lookahead and fractional position
  * between renders so 44.1 kHz effects do not restart their resampling phase every grain. */
-static uint32_t render_voice_samples(Voice *v, float *out, uint32_t want, uint32_t output_rate) {
+static uint32_t render_voice_samples(Voice *v, float *out, uint32_t want, uint32_t output_rate,
+                                      RenderCallbacks *events) {
     const double rate = v->format.sample_rate ? v->format.sample_rate : output_rate;
     const double step = rate * v->pitch / output_rate;
-    if (!v->resample_started && step == 1.0) return voice_samples(v, out, want);
+    if (!v->resample_started && step == 1.0) return voice_samples(v, out, want, events);
     if (!v->resample_started) {
-        v->resample_current_valid = voice_samples(v, v->resample_current, 1) != 0;
-        v->resample_next_valid = voice_samples(v, v->resample_next, 1) != 0;
+        v->resample_current_valid = voice_samples(v, v->resample_current, 1, events) != 0;
+        v->resample_next_valid = voice_samples(v, v->resample_next, 1, events) != 0;
         v->resample_started = 1;
     }
     uint32_t done = 0;
@@ -343,7 +464,7 @@ static uint32_t render_voice_samples(Voice *v, float *out, uint32_t want, uint32
             v->resample_phase -= 1.0;
             memcpy(v->resample_current, v->resample_next, sizeof(v->resample_current));
             v->resample_current_valid = v->resample_next_valid;
-            v->resample_next_valid = voice_samples(v, v->resample_next, 1) != 0;
+            v->resample_next_valid = voice_samples(v, v->resample_next, 1, events) != 0;
         }
     }
     return done;
@@ -414,7 +535,8 @@ static void diagnose_voices(const System *s, uint32_t outputs) {
 }
 
 /* sceNgs2SystemRender(handle, buffers, count): all buffers receive the same point in time. */
-static ABI int32_t system_render(void *handle, const RenderBufferInfo *buffers, uint32_t count) {
+static int32_t system_render_locked(void *handle, const RenderBufferInfo *buffers, uint32_t count,
+                                     RenderCallbacks *events) {
     System *s = handle;
     if (!s || s->magic != SYSTEM_MAGIC) return ERR_INVALID_SYSTEM_HANDLE;
     if (count && !buffers) return ERR_INVALID_BUFFER_ADDRESS;
@@ -441,10 +563,11 @@ static ABI int32_t system_render(void *handle, const RenderBufferInfo *buffers, 
             Voice *v = &r->voices[n];
             if (!v->source_ready || !(v->state & VOICE_STATE_PLAYING) ||
                 (v->state & VOICE_STATE_PAUSED)) continue;
-            uint32_t produced = render_voice_samples(v, scratch, grain, s->sample_rate);
+            uint32_t produced = render_voice_samples(v, scratch, grain, s->sample_rate, events);
             if (!produced) {
-                v->state = (v->state & ~VOICE_STATE_PLAYING) | VOICE_STATE_EMPTY;
-                if (v->format.type != WAVEFORM_ATRAC9) ++pcm_ends;
+                v->state |= VOICE_STATE_EMPTY;
+                if (!v->accepts_blocks) v->state &= ~VOICE_STATE_PLAYING;
+                if (!v->accepts_blocks && v->format.type != WAVEFORM_ATRAC9) ++pcm_ends;
                 continue;
             }
             for (uint32_t i = 0; i < count; ++i) {
@@ -466,11 +589,11 @@ static ABI int32_t system_render(void *handle, const RenderBufferInfo *buffers, 
     diagnose_voices(s, count);
     if (renders <= 3 || !(renders % 500))
         TRACE("SystemRender(system=%p, buffers=%u) #%zu\n", handle, count, renders);
-    return 0;
+    return events->error;
 }
 /* sceNgs2RackCreateWithAllocator(system, rackId, option, allocator, outHandle): a rack is a bank
  * of voices of one kind. Its option contains the maximum number of voices. */
-static ABI int32_t rack_create(void *system, uint32_t rack_id, const void *option,
+static int32_t rack_create_locked(void *system, uint32_t rack_id, const void *option,
                                const void *allocator, void **out) {
     (void)allocator;
     System *s = system;
@@ -497,7 +620,7 @@ static ABI int32_t rack_create(void *system, uint32_t rack_id, const void *optio
           system, rack_id, option, (void *)r, count);
     return 0;
 }
-static ABI int32_t rack_destroy(void *handle, ContextBufferInfo *out) {
+static int32_t rack_destroy_locked(void *handle, ContextBufferInfo *out) {
     Rack *r = handle;
     if (!r || r->magic != RACK_MAGIC) return ERR_INVALID_RACK_HANDLE;
     System *owner = r->system;
@@ -515,7 +638,7 @@ static ABI int32_t rack_destroy(void *handle, ContextBufferInfo *out) {
     return 0;
 }
 /* sceNgs2RackGetVoiceHandle(rack, index, outHandle): voices are numbered inside their rack. */
-static ABI int32_t rack_voice_handle(void *handle, uint32_t index, void **out) {
+static int32_t rack_voice_handle_locked(void *handle, uint32_t index, void **out) {
     Rack *r = handle;
     if (!r || r->magic != RACK_MAGIC) return ERR_INVALID_RACK_HANDLE;
     if (!out) return ERR_INVALID_OUT_ADDRESS;
@@ -526,9 +649,10 @@ static ABI int32_t rack_voice_handle(void *handle, uint32_t index, void **out) {
 }
 /* sceNgs2VoiceControl(voice, paramList): a chain of parameter blocks (set a waveform, a pitch,
  * a matrix, play, stop). Event values are PS4 ordinals, not a bit mask. */
-static ABI int32_t voice_control(void *handle, const void *param_list) {
+static int32_t voice_control_locked(void *handle, const void *param_list) {
     Voice *v = handle;
     if (!v || v->magic != VOICE_MAGIC) return ERR_INVALID_VOICE_HANDLE;
+    if (!param_list) return ERR_INVALID_PARAM_ADDRESS;
     /* Any parameter at all means the engine has taken this voice; shadPS4's NGS2 reports the
      * same single flag. With no flag the caller reads the voice back as never allocated. */
     v->state |= VOICE_STATE_IN_USE;
@@ -536,7 +660,7 @@ static ABI int32_t voice_control(void *handle, const void *param_list) {
     const unsigned char *at = param_list;
     for (unsigned guard = 0; at && guard < 64; ++guard) {
         const VoiceParamHeader *h = (const VoiceParamHeader *)at;
-        if (!h->size) break;
+        if (h->size < sizeof(*h)) return ERR_INVALID_PARAM_SIZE;
         if (h->id == PARAM_VOICE_EVENT && h->size >= sizeof(*h) + 4) {
             uint32_t event;
             memcpy(&event, at + sizeof(*h), 4);
@@ -553,6 +677,7 @@ static ABI int32_t voice_control(void *handle, const void *param_list) {
                 /* Scream releases its pool slot only for zero state or EMPTY (eboot 0x142079).
                  * With no release envelope implemented, stopping completes the voice now. */
                 v->state = VOICE_STATE_IN_USE | VOICE_STATE_STOPPED | VOICE_STATE_EMPTY;
+                ++v->generation;
                 if (v->format.type != WAVEFORM_ATRAC9) ++pcm_stops;
                 break;
             case EVENT_PAUSE: v->state |= VOICE_STATE_PAUSED; break;
@@ -564,6 +689,20 @@ static ABI int32_t voice_control(void *handle, const void *param_list) {
                 is_sampler_param(h->id, PARAM_INDEX_ADD_WAVEFORM_BLOCKS) ? PARAM_SAMPLER_WAVEFORM_BLOCKS :
                 is_sampler_param(h->id, PARAM_INDEX_PITCH) ? PARAM_SAMPLER_PITCH :
                 h->id) {
+        case 7u: {
+            if (h->size < 32) return ERR_INVALID_PARAM_SIZE;
+            VoiceCallback callback; uintptr_t user_data; uint32_t flags;
+            memcpy(&callback, at + 8, sizeof(callback));
+            memcpy(&user_data, at + 16, sizeof(user_data));
+            memcpy(&flags, at + 24, sizeof(flags));
+            if (flags & ~(CALLBACK_BLOCK_END | CALLBACK_BLOCK_REPEAT))
+                return ERR_INVALID_CALLBACK_FLAG;
+            v->callback = callback; v->callback_data = user_data; v->callback_flags = flags;
+            ++v->generation;
+            TRACE("  callback voice=%p handler=%p data=%p flags=0x%x\n", handle,
+                  (void *)(uintptr_t)callback, (void *)user_data, flags);
+            break;
+        }
         case PARAM_SAMPLER_PITCH: {
             float ratio;
             if (h->size < sizeof(*h) + sizeof(ratio)) break;
@@ -590,30 +729,27 @@ static ABI int32_t voice_control(void *handle, const void *param_list) {
             if (h->size >= sizeof(*h) + 4) memcpy(&v->output_id, at + sizeof(*h), 4);
             break;
         case PARAM_SAMPLER_SETUP: {
+            if (h->size < sizeof(*h) + sizeof(WaveformFormat)) return ERR_INVALID_PARAM_SIZE;
             const WaveformFormat *f = (const WaveformFormat *)(at + sizeof(*h));
+            free(v->blocks); v->blocks = NULL; v->block_count = 0;
+            v->accepts_blocks = 1; ++v->generation;
             v->format = *f;
+            rewind_waveform(v);
             TRACE("  setup voice=%p type=0x%x channels=%u rate=%u config=0x%x\n",
                   handle, f->type, f->channels, f->sample_rate, f->config);
             break;
         }
         case PARAM_SAMPLER_WAVEFORM_BLOCKS: {
             /* data, flags, numBlocks, aBlock */
+            if (h->size < 32) return ERR_INVALID_PARAM_SIZE;
             const unsigned char *body = at + sizeof(*h);
             const void *data; uint32_t flags, count; const WaveformBlock *blocks;
             memcpy(&data,body,sizeof(data));
             memcpy(&flags,body+8,4);
             memcpy(&count,body+12,4);
             memcpy(&blocks,body+16,sizeof(blocks));
-            WaveformBlock *copy = NULL;
-            if (count && blocks) {
-                copy = calloc(count, sizeof(*copy));
-                if (!copy) return ERR_OUT_OF_MEMORY;
-                memcpy(copy, blocks, (size_t)count * sizeof(*copy));
-            }
-            free(v->blocks);
-            v->data = data; v->block_count = copy ? count : 0; v->blocks = copy;
-            rewind_waveform(v);
-            v->state &= ~VOICE_STATE_EMPTY;
+            int32_t result = queue_blocks(v, data, flags, count, blocks);
+            if (result) return result;
             TRACE("  waveform voice=%p data=%p flags=0x%x blocks=%u list=%p\n",
                   handle, data, flags, count, (const void *)blocks);
             /* The first bytes of the sound identify it: searching the bank for them says which
@@ -621,7 +757,8 @@ static ABI int32_t voice_control(void *handle, const void *param_list) {
             if (tracing() && data && blocks && count) {
                 const unsigned char *d = (const unsigned char *)data + blocks[0].data_offset;
                 fprintf(stderr, "NGS2:     fingerprint:");
-                for (int i = 0; i < 24; ++i) fprintf(stderr, " %02x", d[i]);
+                for (uint32_t i = 0; i < 24 && i < blocks[0].data_size; ++i)
+                    fprintf(stderr, " %02x", d[i]);
                 fprintf(stderr, "\n");
             }
             if (tracing() && data && blocks && count && count < 64) {
@@ -650,7 +787,7 @@ static ABI int32_t voice_control(void *handle, const void *param_list) {
 }
 /* sceNgs2VoiceGetState(voice, outState, size) and sceNgs2VoiceGetStateFlags(voice, outFlags):
  * no flags means the voice is neither in use nor playing, so the game is free to reuse it. */
-static ABI int32_t voice_get_state(void *handle, VoiceState *out, uint64_t size) {
+static int32_t voice_get_state_locked(void *handle, VoiceState *out, uint64_t size) {
     Voice *v = handle;
     if (!v || v->magic != VOICE_MAGIC) return ERR_INVALID_VOICE_HANDLE;
     if (!out) return ERR_INVALID_OUT_ADDRESS;
@@ -658,7 +795,7 @@ static ABI int32_t voice_get_state(void *handle, VoiceState *out, uint64_t size)
     out->state_flags = v->state;
     return 0;
 }
-static ABI int32_t voice_get_state_flags(void *handle, uint32_t *out) {
+static int32_t voice_get_state_flags_locked(void *handle, uint32_t *out) {
     Voice *v = handle;
     if (!out) return ERR_INVALID_OUT_ADDRESS;
     if (!v || v->magic != VOICE_MAGIC) { *out = 0; return ERR_INVALID_VOICE_HANDLE; }
@@ -720,6 +857,59 @@ static ABI int32_t waveform_frame_info(const void *format, uint32_t *frame_size,
     return 0;
 }
 
+/* Serialize graph/queue changes, but never hold the state lock while entering guest code. */
+#define LOCKED_RESULT(expression) do { \
+    pthread_mutex_lock(&state_lock); \
+    int32_t result = (expression); \
+    pthread_mutex_unlock(&state_lock); \
+    return result; \
+} while (0)
+static ABI int32_t system_create(const void *option, const void *allocator, void **out) {
+    LOCKED_RESULT(system_create_locked(option, allocator, out));
+}
+static ABI int32_t system_destroy(void *handle, ContextBufferInfo *out) {
+    LOCKED_RESULT(system_destroy_locked(handle, out));
+}
+static ABI int32_t rack_create(void *system, uint32_t id, const void *option,
+                               const void *allocator, void **out) {
+    LOCKED_RESULT(rack_create_locked(system, id, option, allocator, out));
+}
+static ABI int32_t rack_destroy(void *handle, ContextBufferInfo *out) {
+    LOCKED_RESULT(rack_destroy_locked(handle, out));
+}
+static ABI int32_t rack_voice_handle(void *rack, uint32_t index, void **out) {
+    LOCKED_RESULT(rack_voice_handle_locked(rack, index, out));
+}
+static ABI int32_t voice_control(void *voice, const void *params) {
+    LOCKED_RESULT(voice_control_locked(voice, params));
+}
+static ABI int32_t voice_get_state(void *voice, VoiceState *out, uint64_t size) {
+    LOCKED_RESULT(voice_get_state_locked(voice, out, size));
+}
+static ABI int32_t voice_get_state_flags(void *voice, uint32_t *out) {
+    LOCKED_RESULT(voice_get_state_flags_locked(voice, out));
+}
+#undef LOCKED_RESULT
+static ABI int32_t system_render(void *system, const RenderBufferInfo *buffers, uint32_t count) {
+    RenderCallbacks events = {0};
+    pthread_mutex_lock(&state_lock);
+    int32_t result = system_render_locked(system, buffers, count, &events);
+    pthread_mutex_unlock(&state_lock);
+    for (size_t i = 0; i < events.count; ++i) {
+        PendingCallback *event = &events.items[i];
+        pthread_mutex_lock(&state_lock);
+        Voice *v = event->voice;
+        VoiceCallback callback = v->magic == VOICE_MAGIC && v->rack->magic == RACK_MAGIC &&
+            ((System *)v->rack->system)->magic == SYSTEM_MAGIC &&
+            v->generation == event->generation ? v->callback : NULL;
+        if (callback) ++delivered_callbacks;
+        pthread_mutex_unlock(&state_lock);
+        if (callback) GUEST_CALL1(VoiceCallback, callback, &event->info);
+    }
+    free(events.items);
+    return result;
+}
+
 static const RuntimeExport exports[]={
     {"sceNgs2SystemCreateWithAllocator",system_create}, {"sceNgs2SystemDestroy",system_destroy},
     {"sceNgs2SystemRender",system_render},
@@ -733,6 +923,8 @@ uintptr_t runtime_ngs2_resolve(const char *name) { return RUNTIME_LOOKUP(exports
 void runtime_ngs2_report(void) {
     if (!systems && !racks) return;
     printf("Runtime: NGS2 systems=%zu, racks=%zu, voice handles=%zu, renders=%zu, "
-           "%zu bytes rendered, ATRAC9 superframes decoded=%zu, voice mixes=%zu\n",
-           systems, racks, voices_handed, renders, rendered_bytes, decoded_frames, mixed_voices);
+           "%zu bytes rendered, ATRAC9 superframes decoded=%zu, voice mixes=%zu, "
+           "blocks submitted=%zu, callbacks=%zu\n",
+           systems, racks, voices_handed, renders, rendered_bytes, decoded_frames, mixed_voices,
+           queued_blocks, delivered_callbacks);
 }

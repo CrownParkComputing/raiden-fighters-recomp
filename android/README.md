@@ -6,9 +6,12 @@ together; it does not replace the collection menu. Target input is CUSA53688 v1.
 `c2e3a0879fed1f5d1269c2c9d9ad67fc5a0e4debe100be46ab9b93859766e3e4`.
 
 The application ID is `com.crownparkcomputing.raidenfighters`, activity
-`.RaidenFightersActivity`, label **Raiden Fighters Remix**, version 0.1/code 1.
+`.RaidenFightersActivity`, label **Raiden Fighters Remix**, version 0.2/code 2.
 It installs separately from the other ports. PS4 executables, ROMs and game data
 stay outside the APK. Keep the full collection tree when staging data.
+
+Version 0.2 includes the NGS2 streaming-buffer queue and guest refill callbacks;
+it updates the runtime without changing the staged game data or save paths.
 
 The Android target is Retroid Pocket Flip2, Snapdragon 865/Adreno 650, ARM64,
 API 31 or later. Device boot, rendering, audio and performance are not yet

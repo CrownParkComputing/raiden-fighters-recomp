@@ -4,6 +4,17 @@
 #include "../src/runtime_ngs2.c"
 #include <assert.h>
 #include <math.h>
+#include <unistd.h>
+
+#ifdef TEMPEST_FEX
+static unsigned guest_callback_calls;
+uintptr_t runtime_fex_call(uintptr_t entry, const uintptr_t *arguments, size_t count) {
+    assert(count == 1);
+    ++guest_callback_calls;
+    ((VoiceCallback)entry)((const VoiceCallbackInfo *)arguments[0]);
+    return 0;
+}
+#endif
 
 void *runtime_low_alloc(size_t size) { return calloc(1,size); }
 void runtime_low_free(void *pointer) { free(pointer); }
@@ -331,7 +342,124 @@ static void test_stopped_effects_return_to_pool(void) {
     fixture_destroy(&f);
 }
 
+/* RFD supplies a logical sample window and then APPENDs its payload. Its block-end callback
+ * writes new PCM into the completed staging slot and resubmits it through VoiceControl. */
+typedef struct {
+    Fixture f;
+    int16_t staging[3][4];
+    unsigned next[3], callbacks, limit, frames;
+    int action;
+} Stream;
+
+static int32_t stream_blocks(Stream *s, const void *data, uint32_t flags,
+                              uint32_t count, const WaveformBlock *blocks) {
+    struct { VoiceParamHeader header; const void *data; uint32_t flags, count;
+             const WaveformBlock *blocks; }
+        param={{32,0,0x10000001},data,flags,count,blocks};
+    return voice_control(s->f.source,&param);
+}
+static void stream_submit(Stream *s, unsigned slot, unsigned sequence) {
+    for (unsigned i=0;i<s->frames;++i) s->staging[slot][i]=(int16_t)((sequence+1)*128);
+    WaveformBlock window={.samples=s->frames};
+    assert(stream_blocks(s,s->staging[slot],BLOCK_CONTINUE,1,&window)==0);
+    WaveformBlock bytes={.data_size=s->frames*2,.user_data=slot};
+    assert(stream_blocks(s,s->staging[slot],BLOCK_CONTINUE|BLOCK_APPEND|BLOCK_SILENCE,1,&bytes)==0);
+    /* Neither descriptor may be retained by address. */
+    memset(&window,0xcc,sizeof(window)); memset(&bytes,0xdd,sizeof(bytes));
+}
+static ABI void stream_callback(const VoiceCallbackInfo *info) {
+    Stream *s=(Stream *)info->callback_data;
+    assert(info->voice==s->f.source && info->flag==CALLBACK_BLOCK_END);
+    assert(info->data_size==s->frames*2 && info->reserved==0 && info->reserved2==0);
+    assert(info->attributes==0 && info->repeated==0 && info->user_data<3);
+    unsigned slot=(unsigned)info->user_data;
+    assert(info->data==s->staging[slot]);
+    assert(slot==s->callbacks%3);
+    ++s->callbacks;
+    if (s->action==1) { /* Stop must invalidate the remaining events captured in this grain. */
+        event(s->f.source,EVENT_STOP); return;
+    }
+    if (s->action==2) {
+        s->action=0;
+        WaveformBlock reset={.data_size=s->frames*2,.samples=s->frames,.user_data=0};
+        assert(stream_blocks(s,s->staging[0],BLOCK_RESET,1,&reset)==0);
+        return;
+    }
+    if (s->callbacks<s->limit) {
+        stream_submit(s,slot,s->next[slot]);
+        s->next[slot]+=3;
+    }
+}
+static void stream_init(Stream *s, unsigned frames) {
+    memset(s,0,sizeof(*s)); fixture_init(&s->f); s->frames=frames;
+    pcm_setup(&s->f,WAVEFORM_PCM_I16_LE,1,48000);
+    struct { VoiceParamHeader header; VoiceCallback callback; uintptr_t data;
+             uint32_t flags, reserved; }
+        param={{32,0,7},stream_callback,(uintptr_t)s,CALLBACK_BLOCK_END,0};
+    assert(voice_control(s->f.source,&param)==0);
+    for (unsigned i=0;i<3;++i) { stream_submit(s,i,i); s->next[i]=i+3; }
+}
+
+static void test_stream_refill_order_and_abi(void) {
+    Stream s; stream_init(&s,4); s.limit=1000;
+    event(s.f.source,EVENT_PLAY);
+    for (unsigned grain=0;grain<96;++grain) {
+        render(&s.f); silent(s.f.output[0]);
+        float expected[8];
+        for (unsigned i=0;i<8;++i) expected[i]=(float)(grain+1)/256.0f;
+        check_pcm(s.f.output[1],expected,8);
+        assert(s.callbacks==grain+1);
+    }
+    event(s.f.source,EVENT_STOP);
+    render(&s.f); silent(s.f.output[1]); assert(s.callbacks==96);
+    fixture_destroy(&s.f);
+}
+static void test_stream_reset_stop_and_invalid_calls(void) {
+    Stream s; stream_init(&s,1); s.action=1;
+    event(s.f.source,EVENT_PLAY);
+    render(&s.f);
+    /* All three complete in this grain, but the first callback's STOP suppresses stale events. */
+    assert(s.callbacks==1);
+    render(&s.f); silent(s.f.output[1]); assert(s.callbacks==1);
+    fixture_destroy(&s.f);
+
+    stream_init(&s,1); s.action=2;
+    event(s.f.source,EVENT_PLAY); render(&s.f); assert(s.callbacks==1);
+    /* The callback reset discarded slots1/2. Its new slot0 has exactly one sample. */
+    s.callbacks=0;
+    render(&s.f);
+    check_pcm(s.f.output[1],(const float[8]){1.0f/256,1.0f/256,0,0,0,0,0,0},8);
+    assert(s.callbacks==1);
+    render(&s.f); silent(s.f.output[1]);
+    fixture_destroy(&s.f);
+
+    stream_init(&s,4);
+    assert(voice_control(s.f.source,NULL)==ERR_INVALID_PARAM_ADDRESS);
+    assert(stream_blocks(&s,NULL,BLOCK_RESET,1,NULL)==ERR_INVALID_BLOCK_ADDRESS);
+    WaveformBlock bytes={.data_size=8,.samples=4};
+    assert(stream_blocks(&s,NULL,BLOCK_RESET,1,&bytes)==ERR_INVALID_BUFFER_ADDRESS);
+    assert(stream_blocks(&s,s.staging[0],BLOCK_RESET,MAX_BLOCKS+1,&bytes)==ERR_INVALID_BLOCK_COUNT);
+    struct { VoiceParamHeader header; VoiceCallback callback; uintptr_t data;
+             uint32_t flags, reserved; }
+        invalid={{32,0,7},stream_callback,(uintptr_t)&s,0x80,0};
+    assert(voice_control(s.f.source,&invalid)==ERR_INVALID_CALLBACK_FLAG);
+    invalid.header.size=8;
+    assert(voice_control(s.f.source,&invalid)==ERR_INVALID_PARAM_SIZE);
+    event(s.f.source,EVENT_PLAY);
+    /* Rejected reset requests left the original queue and callback registration intact. */
+    for (unsigned i=0;i<3;++i) {
+        render(&s.f);
+        for (unsigned j=0;j<8;++j) {
+            float expected=(float)(i+1)/256*(32767.0f/32768.0f);
+            assert(fabsf(s.f.output[1][j]-expected)<0.000002f);
+        }
+    }
+    assert(s.callbacks==3);
+    fixture_destroy(&s.f);
+}
+
 int main(void) {
+    alarm(20); /* A callback accidentally invoked under the mixer lock must fail boundedly. */
     test_output_routing_and_clock();
     test_play_before_waveform();
     test_repeat_sample_windows();
@@ -339,6 +467,12 @@ int main(void) {
     test_pcm_windows_pause_and_partial_frames();
     test_pcm_resampling_across_grains();
     test_stopped_effects_return_to_pool();
-    puts("NGS2 routing, grain clock, PS4 events and PCM effects passed");
+    test_stream_refill_order_and_abi();
+    test_stream_reset_stop_and_invalid_calls();
+#ifdef TEMPEST_FEX
+    assert(guest_callback_calls>=96);
+#endif
+    alarm(0);
+    puts("NGS2 routing, clock, PCM/ATRAC9, streaming order and guest callbacks passed");
     return 0;
 }
