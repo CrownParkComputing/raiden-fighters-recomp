@@ -114,6 +114,105 @@ static uint64_t resolver_metadata_calls(void) {
     return atomic_load(&file_perf[FP_EXACT_STAT].calls)+atomic_load(&file_perf[FP_COMPONENT_STAT].calls)+
         atomic_load(&file_perf[FP_FINAL_STAT].calls)+atomic_load(&file_perf[FP_SCAN].calls);
 }
+static uint64_t resolver_stat_calls(void) {
+    return atomic_load(&file_perf[FP_EXACT_STAT].calls)+atomic_load(&file_perf[FP_COMPONENT_STAT].calls)+
+        atomic_load(&file_perf[FP_FINAL_STAT].calls);
+}
+static void cold_snapshot_paths(const char *app) {
+    char cold[1024],nested[1024],execute[1024],readable[1024],large[1024],path[2048];
+    snprintf(cold,sizeof(cold),"%s/Cold",app);
+    snprintf(nested,sizeof(nested),"%s/Cold/Nested",app);
+    snprintf(execute,sizeof(execute),"%s/Cold/ExecuteOnly",app);
+    snprintf(readable,sizeof(readable),"%s/Cold/Readable",app);
+    snprintf(large,sizeof(large),"%s/Cold/Large",app);
+    assert(mkdir(cold,0700)==0 && mkdir(nested,0700)==0 && mkdir(execute,0700)==0);
+    assert(mkdir(readable,0700)==0 && mkdir(large,0700)==0);
+    make_asset(nested,"existing.bin",'E');
+    make_asset(nested,"Case.bin",'A'); make_asset(nested,"case.bin",'B');
+    make_asset(execute,"visible.bin",'X'); make_asset(readable,"inside.bin",'R');
+    snprintf(path,sizeof(path),"%s/DirLink",cold); assert(symlink("Nested",path)==0);
+    snprintf(path,sizeof(path),"%s/FileLink",cold); assert(symlink("Nested/existing.bin",path)==0);
+    const char *mode=getenv("TEMPEST_FILE_CACHE");
+    int enabled=!mode || strcmp(mode,"0");
+
+    /* This is a cold full-path lookup. When the filesystem supplies usable dirent
+     * types, only the final stat and the real open are needed for an existing file. */
+    assert(runtime_file_mount("/app0",app)==0);
+    uint64_t stats=resolver_stat_calls(),opened=atomic_load(&file_perf[FP_OPEN].calls);
+    uint64_t positive=atomic_load(&snapshot_perf_positive);
+    int fd=posix_open("/app0/cold/nested/existing.bin",0,0);
+    char value=0;
+    assert(fd>=3 && posix_read(fd,&value,1)==1 && value=='E' && posix_close(fd)==0);
+    int fast=enabled && atomic_load(&snapshot_perf_positive)>positive;
+    if (fast) assert(resolver_stat_calls()==stats+1);
+    assert(atomic_load(&file_perf[FP_OPEN].calls)==opened+1);
+    stats=resolver_metadata_calls(); opened=atomic_load(&file_perf[FP_OPEN].calls);
+    assert(posix_open("/app0/cold/nested/first-cold-miss.dxa",0,0)==-1 && guest_errno==2);
+    assert(posix_open("/app0/cold/nested/CASE.BIN",0,0)==-1 && guest_errno==2);
+    if (fast) {
+        assert(resolver_metadata_calls()==stats); /* The name snapshots are already complete. */
+        assert(atomic_load(&file_perf[FP_OPEN].calls)==opened);
+    } else if (!enabled) assert(atomic_load(&file_perf[FP_OPEN].calls)==opened+2);
+    expect_asset("/app0/cold/nested/Case.bin",'A');
+    expect_asset("/app0/cold/nested/case.bin",'B');
+
+    /* A symlink is not a proven immutable directory/regular-file entry. Its host
+     * resolution remains available through the old resolver, both at leaf and parent. */
+    uint64_t fallback=atomic_load(&snapshot_perf_fallback);
+    expect_asset("/app0/Cold/FileLink",'E');
+    expect_asset("/app0/Cold/DirLink/existing.bin",'E');
+    if (fast) assert(atomic_load(&snapshot_perf_fallback)==fallback+2);
+
+    /* Execute-only directories are traversable without being listable. Conversely,
+     * a readable but unsearchable directory must report EACCES, even for a missing name. */
+    assert(chmod(execute,0111)==0 && chmod(readable,0400)==0);
+    assert(runtime_file_mount("/app0",app)==0);
+    expect_asset("/app0/Cold/ExecuteOnly/visible.bin",'X');
+    opened=atomic_load(&file_perf[FP_OPEN].calls);
+    for (unsigned i=0;i<2;++i)
+        assert(posix_open("/app0/Cold/ExecuteOnly/absent.bin",0,0)==-1 && guest_errno==2);
+    if (geteuid()!=0) {
+        assert(atomic_load(&file_perf[FP_OPEN].calls)==opened+2);
+        for (unsigned i=0;i<2;++i) {
+            assert(posix_open("/app0/Cold/Readable/inside.bin",0,0)==-1 && guest_errno==13);
+            assert(posix_open("/app0/Cold/Readable/absent.bin",0,0)==-1 && guest_errno==13);
+        }
+    }
+    assert(chmod(execute,0700)==0 && chmod(readable,0700)==0);
+
+    /* An oversized directory cannot establish a complete folded-name inventory.
+     * Existing exact paths still work, and misses must reach the host on each call. */
+    char name[241];
+    for (unsigned i=0;i<1100;++i) {
+        snprintf(name,6,"%04u-",i); memset(name+5,'x',235); name[240]=0;
+        make_asset(large,name,'L');
+    }
+    assert(runtime_file_mount("/app0",app)==0);
+    uint64_t rejected=atomic_load(&snapshot_perf_rejected_dirs);
+    snprintf(path,sizeof(path),"/app0/Cold/Large/%s",name);
+    expect_asset(path,'L');
+    if (enabled) assert(atomic_load(&snapshot_perf_rejected_dirs)>rejected);
+    opened=atomic_load(&file_perf[FP_OPEN].calls);
+    for (unsigned i=0;i<2;++i)
+        assert(posix_open("/app0/Cold/Large/absent.bin",0,0)==-1 && guest_errno==2);
+    assert(atomic_load(&file_perf[FP_OPEN].calls)==opened+2);
+    for (unsigned i=0;i<1100;++i) {
+        snprintf(name,6,"%04u-",i); memset(name+5,'x',235); name[240]=0;
+        snprintf(path,sizeof(path),"%s/%s",large,name); assert(unlink(path)==0);
+    }
+    snprintf(path,sizeof(path),"%s/DirLink",cold); assert(unlink(path)==0);
+    snprintf(path,sizeof(path),"%s/FileLink",cold); assert(unlink(path)==0);
+    snprintf(path,sizeof(path),"%s/existing.bin",nested); assert(unlink(path)==0);
+    snprintf(path,sizeof(path),"%s/Case.bin",nested); assert(unlink(path)==0);
+    snprintf(path,sizeof(path),"%s/case.bin",nested); assert(unlink(path)==0);
+    snprintf(path,sizeof(path),"%s/visible.bin",execute); assert(unlink(path)==0);
+    snprintf(path,sizeof(path),"%s/inside.bin",readable); assert(unlink(path)==0);
+    assert(rmdir(large)==0 && rmdir(nested)==0 && rmdir(execute)==0 && rmdir(readable)==0 && rmdir(cold)==0);
+    assert(runtime_file_mount("/app0",app)==0);
+    printf("Cold immutable lookup: %s; permission, symlink and incomplete-scan fallbacks passed\n",
+        fast ? "one stat for existing, zero stats/opens for absent or ambiguous" :
+        enabled ? "filesystem required conservative fallback" : "cache disabled");
+}
 static void cached_game_paths(const char *app) {
     char directory[1024],alternate[1024],other[1024],path[2048],expected[2048];
     snprintf(directory,sizeof(directory),"%s/Cache",app);
@@ -217,8 +316,11 @@ int main(void) {
     for (int i=0;i<8;++i) { occupied[i]=open("/dev/null",O_RDONLY); assert(occupied[i]>=0); }
     runtime_file_configure(app,user);
     assert(runtime_file_mount("/temp0",user)==0);
+    /* Keep measurement counters intact even on slow sanitizer/remote filesystems. */
+    atomic_store(&file_perf_next,UINT64_MAX);
     case_sensitive_game_assets(app,user);
     cached_game_paths(app);
+    cold_snapshot_paths(app);
     int32_t fd=posix_open("asset.bin",0,0);
     assert(fd>=3);
     char data[16]={0};

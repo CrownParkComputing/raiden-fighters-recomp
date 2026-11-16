@@ -159,7 +159,9 @@ normal play has no diagnostic timeout.
 Game mounts use a bounded cache for resolved paths and confirmed missing files.
 This avoids repeating slow SD-card metadata calls for optional archive probes;
 save and temporary mounts remain uncached. Mount changes invalidate cached
-results. For diagnostics, `TEMPEST_FILE_PERF=1` prints aggregate timings,
+results. Complete searchable directory snapshots also accelerate the first
+lookup; symlinks, unknown types and incomplete or restricted listings use the
+original resolver. For diagnostics, `TEMPEST_FILE_PERF=1` prints aggregate timings,
 `TEMPEST_FILE_CACHE=0` disables this cache, and `TEMPEST_FILE_TRACE=1` restores
 verbose missing-file messages. Ordinary runs keep duplicate game-file misses
 bounded while preserving the total missing count.

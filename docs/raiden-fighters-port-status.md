@@ -83,11 +83,19 @@ for most missing opens. This is an established file-metadata bottleneck, not
 evidence that those optional archives must be supplied. A bounded read-only path cache now avoids repeated metadata work and failed
 opens for confirmed absent files. Exact filename casing, ambiguous matches,
 mount changes and mutable-save behavior retain focused regression coverage.
-The version 0.5/code 5 update is installed. An earlier run reaches Jet arcade
-attract mode at 60 FPS. The updated build now passes the previously stuck
-Continue load and reaches Game Select; individual game-loading checks remain
-in progress. These checks are not a wall-clock loading benchmark for all
-three games.
+The version 0.6/code 6 update is installed. Version 0.5 passed the previously
+stuck Continue load, reached Game Select, and entered a Raiden Fighters player
+stage at 60 FPS. An earlier run reached Jet arcade attract mode at 60 FPS.
+Individual game-switching checks remain in progress.
+
+Cold lookups now use complete searchable directory snapshots, retaining exact
+spelling and rejecting ambiguous folded matches. Unknown entry types, symlinks,
+permission limitations and incomplete listings fall back to the original
+resolver. Existing files still use real stat/open descriptors; save mounts
+remain uncached. On the Retroid, the same 240 existing paths plus 960 distinct
+recorded misses took 33.74 seconds through the version 0.5 resolver and 5.24
+seconds through version 0.6, with all results matching. This read-only file
+benchmark does not measure full game startup or every gameplay transition.
 
 The FEX condition-wait wrapper previously hid its artificial 10 ms timeouts
 and immediately waited again. A notification delivered while the waiter was

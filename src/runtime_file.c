@@ -79,6 +79,9 @@ static _Atomic uint64_t file_perf_hits,file_perf_entries,file_perf_final_skips,
     file_perf_misses,file_perf_suppressed,file_perf_bytes,file_perf_next;
 static _Atomic uint64_t path_perf_positive,path_perf_negative,path_perf_misses,
     path_perf_stores,path_perf_evictions;
+static _Atomic uint64_t snapshot_perf_positive,snapshot_perf_negative,snapshot_perf_fallback,
+    snapshot_perf_unknown,snapshot_perf_special,snapshot_perf_unusable,
+    snapshot_perf_eligible_dirs,snapshot_perf_rejected_dirs;
 static pthread_once_t file_perf_once=PTHREAD_ONCE_INIT;
 static int file_perf_enabled;
 static _Thread_local uint64_t file_lock_started;
@@ -126,6 +129,10 @@ static void file_perf_report(int force) {
     uint64_t positive=atomic_exchange(&path_perf_positive,0),negative=atomic_exchange(&path_perf_negative,0),
         path_misses=atomic_exchange(&path_perf_misses,0),stores=atomic_exchange(&path_perf_stores,0),
         evictions=atomic_exchange(&path_perf_evictions,0);
+    uint64_t snap_positive=atomic_exchange(&snapshot_perf_positive,0),snap_negative=atomic_exchange(&snapshot_perf_negative,0),
+        fallback=atomic_exchange(&snapshot_perf_fallback,0),unknown=atomic_exchange(&snapshot_perf_unknown,0),
+        special=atomic_exchange(&snapshot_perf_special,0),unusable=atomic_exchange(&snapshot_perf_unusable,0),
+        eligible_dirs=atomic_exchange(&snapshot_perf_eligible_dirs,0),rejected_dirs=atomic_exchange(&snapshot_perf_rejected_dirs,0);
     if (total) {
         printf("File perf: resolve %llu/%.3fms; stat exact %llu/%.3fms component %llu/%.3fms final %llu/%.3fms (%llu skipped); scans %llu/%.3fms, cache hits %llu, names %llu\n",
             (unsigned long long)calls[FP_RESOLVE],ns[FP_RESOLVE]/1e6,
@@ -141,6 +148,10 @@ static void file_perf_report(int force) {
         printf("File perf: path cache positive %llu negative %llu misses %llu stores %llu evictions %llu\n",
             (unsigned long long)positive,(unsigned long long)negative,(unsigned long long)path_misses,
             (unsigned long long)stores,(unsigned long long)evictions);
+        printf("File perf: cold snapshots positive %llu negative %llu fallback %llu (unknown type %llu special/non-dir %llu access/incomplete %llu); directories eligible %llu rejected %llu\n",
+            (unsigned long long)snap_positive,(unsigned long long)snap_negative,(unsigned long long)fallback,
+            (unsigned long long)unknown,(unsigned long long)special,(unsigned long long)unusable,
+            (unsigned long long)eligible_dirs,(unsigned long long)rejected_dirs);
     }
     errno=saved;
 }
@@ -182,14 +193,15 @@ typedef struct {
     char *names;
     size_t bytes;
     uint64_t age;
-    int complete;
+    int complete,searchable;
 } CaseDirectory;
+enum { CASE_UNKNOWN,CASE_REGULAR,CASE_DIRECTORY,CASE_SPECIAL };
 static CaseDirectory case_directories[CASE_CACHE_DIRS];
 static uint64_t case_cache_age;
 
 /* Exact suffixes retain the existing per-component spelling precedence. A cached negative
  * carries the original host spelling too: public translate must still return that path.
- * Only confirmed operation failures after complete case resolution populate negatives. */
+ * Complete searchable directory snapshots can prove misses without a failed host open. */
 #define PATH_CACHE_ENTRIES 512
 typedef struct {
     uint64_t age,generation;
@@ -263,6 +275,18 @@ static void clear_case_cache(void) {
     }
     case_cache_age=0;
 }
+static int searchable_directory(DIR *directory) {
+#ifdef _WIN32
+    (void)directory;
+    return 0; /* Retain host case/permission semantics through the stat resolver. */
+#else
+    if (!faccessat(dirfd(directory),".",X_OK,AT_EACCESS)) return 1;
+    if ((errno==EINVAL || errno==ENOSYS || errno==ENOTSUP) &&
+        getuid()==geteuid() && getgid()==getegid())
+        return !faccessat(dirfd(directory),".",X_OK,0);
+    return 0;
+#endif
+}
 static CaseDirectory *case_directory(const char *path) {
     CaseDirectory *slot=&case_directories[0];
     for (size_t i=0;i<CASE_CACHE_DIRS;++i) {
@@ -282,23 +306,32 @@ static CaseDirectory *case_directory(const char *path) {
     snprintf(slot->path,sizeof(slot->path),"%s",path);
     slot->age=++case_cache_age;
     slot->complete=1;
-    size_t capacity=0;
+    slot->searchable=path_cache_enabled && searchable_directory(dir);
+    size_t capacity=0,name_bytes=0;
     struct dirent *entry;
     errno=0;
     while ((entry=readdir(dir))) {
         if (!strcmp(entry->d_name,".") || !strcmp(entry->d_name,"..")) continue;
-        size_t n=strlen(entry->d_name)+1;
-        if (n>CASE_CACHE_NAMES-slot->bytes) { slot->complete=0; break; }
+        size_t n=strlen(entry->d_name)+2; /* dirent kind byte, then NUL-terminated name */
+        /* Keep the original filename-byte limit, including in cache-off mode.
+         * Type metadata uses at most one extra byte per two filename bytes. */
+        if (n-1>CASE_CACHE_NAMES-name_bytes) { slot->complete=0; break; }
         if (slot->bytes+n>capacity) {
             size_t next=capacity ? capacity*2 : 4096;
             if (next<slot->bytes+n) next=slot->bytes+n;
-            if (next>CASE_CACHE_NAMES) next=CASE_CACHE_NAMES;
+            if (next>CASE_CACHE_NAMES*3u/2u) next=CASE_CACHE_NAMES*3u/2u;
             char *names=realloc(slot->names,next);
             if (!names) { slot->complete=0; break; }
             slot->names=names; capacity=next;
         }
-        memcpy(slot->names+slot->bytes,entry->d_name,n);
-        slot->bytes+=n;
+        unsigned char kind=CASE_UNKNOWN;
+#ifndef _WIN32
+        kind=entry->d_type==DT_DIR ? CASE_DIRECTORY : entry->d_type==DT_REG ? CASE_REGULAR :
+             entry->d_type==DT_UNKNOWN ? CASE_UNKNOWN : CASE_SPECIAL;
+#endif
+        slot->names[slot->bytes]=(char)kind;
+        memcpy(slot->names+slot->bytes+1,entry->d_name,n-1);
+        slot->bytes+=n; name_bytes+=n-1;
         if (file_perf_enabled) atomic_fetch_add_explicit(&file_perf_entries,1,memory_order_relaxed);
         errno=0;
     }
@@ -307,29 +340,73 @@ static CaseDirectory *case_directory(const char *path) {
     file_perf_end(FP_SCAN,scan_start);
     /* A partial list cannot establish that a folded name is unambiguous. */
     if (!slot->complete) { free(slot->names); slot->names=NULL; slot->bytes=0; }
+    if (file_perf_enabled && path_cache_enabled)
+        atomic_fetch_add_explicit(slot->complete && slot->searchable ? &snapshot_perf_eligible_dirs :
+            &snapshot_perf_rejected_dirs,1,memory_order_relaxed);
     return slot;
 }
 static unsigned char filename_fold(unsigned char c) {
     return c>='A' && c<='Z' ? (unsigned char)(c+('a'-'A')) : c;
 }
-static const char *case_name(const char *directory,const char *name,size_t length,int *complete) {
+static const char *case_name_kind(const char *directory,const char *name,size_t length,
+                                   int *complete,int *searchable,unsigned char *kind) {
     CaseDirectory *entry=case_directory(directory);
     *complete=entry && entry->complete;
+    if (searchable) *searchable=entry && entry->searchable;
     if (!entry || !entry->complete) return NULL;
     const char *match=NULL;
+    unsigned char match_kind=CASE_UNKNOWN;
     int ambiguous=0;
     for (size_t offset=0;offset<entry->bytes;) {
+        unsigned char candidate_kind=(unsigned char)entry->names[offset++];
         const char *candidate=entry->names+offset;
         size_t n=strlen(candidate); offset+=n+1;
         if (n!=length) continue;
         size_t i=0;
         while (i<n && filename_fold((unsigned char)candidate[i])==filename_fold((unsigned char)name[i])) ++i;
         if (i!=n) continue;
-        if (!memcmp(candidate,name,n)) return candidate;
+        if (!memcmp(candidate,name,n)) { if (kind) *kind=candidate_kind; return candidate; }
         if (match) ambiguous=1; /* Keep looking for an exact spelling, if present. */
-        else match=candidate;
+        else { match=candidate; match_kind=candidate_kind; }
     }
+    if (kind) *kind=match_kind;
     return ambiguous ? NULL : match;
+}
+static const char *case_name(const char *directory,const char *name,size_t length,int *complete) {
+    return case_name_kind(directory,name,length,complete,NULL,NULL);
+}
+/* Cold lookup using only complete, searchable directory snapshots. Known directory entry
+ * types let us avoid per-component stats; a positive leaf still gets one real stat. */
+static int snapshot_game_path(const Mount *mount,const char *suffix,char *out,size_t size) {
+    if (!*suffix) return 0;
+    char resolved[CASE_CACHE_PATH]; size_t used=strlen(mount->host);
+    memcpy(resolved,mount->host,used+1);
+    while (*suffix) {
+        ++suffix;
+        const char *end=strchr(suffix,'/');
+        size_t n=end ? (size_t)(end-suffix) : strlen(suffix);
+        int complete=0,searchable=0; unsigned char kind=CASE_UNKNOWN;
+        const char *name=case_name_kind(resolved,suffix,n,&complete,&searchable,&kind);
+        if (!complete || !searchable) {
+            if (file_perf_enabled) atomic_fetch_add_explicit(&snapshot_perf_unusable,1,memory_order_relaxed);
+            return 0;
+        }
+        if (!name) return -1;
+        if (kind==CASE_UNKNOWN || (end ? kind!=CASE_DIRECTORY :
+            kind!=CASE_DIRECTORY && kind!=CASE_REGULAR)) {
+            if (file_perf_enabled) atomic_fetch_add_explicit(kind==CASE_UNKNOWN ?
+                &snapshot_perf_unknown : &snapshot_perf_special,1,memory_order_relaxed);
+            return 0;
+        }
+        if (used+n+2>sizeof(resolved)) return 0;
+        resolved[used++]='/'; memcpy(resolved+used,name,n); used+=n; resolved[used]=0;
+        suffix+=n;
+    }
+    HostStat st;
+    if (file_case_stat(resolved,&st,FP_FINAL_STAT)) return 0;
+    if (used>=size) return 0;
+    memcpy(out,resolved,used+1);
+    return 1;
 }
 /* Leave the original normalized path untouched on a miss or ambiguity. Public
  * translate also serves callers that need the host spelling of missing paths. */
@@ -456,9 +533,19 @@ static int translate_resolved(const char *guest,char *out,size_t size,PathResolu
                     if (resolution) resolution->error=cached->error;
                 }
             } else {
-                int status=case_game_path(m,suffix,out,size);
+                int snapshot=path_cache_enabled ? snapshot_game_path(m,suffix,out,size) : 0;
+                if (file_perf_enabled && path_cache_enabled)
+                    atomic_fetch_add_explicit(snapshot>0 ? &snapshot_perf_positive : snapshot<0 ?
+                        &snapshot_perf_negative : &snapshot_perf_fallback,1,memory_order_relaxed);
+                int status=snapshot ? snapshot : case_game_path(m,suffix,out,size);
                 if (path_cache_enabled && status>0) store_path(mount,suffix,out,0);
                 if (resolution) resolution->stable_missing=status<0;
+                /* Only the snapshot walk proves every parent is a searchable directory.
+                 * Fallbacks (including symlinks) retain the original host-error check. */
+                if (snapshot<0) {
+                    store_path(mount,suffix,out,ENOENT);
+                    if (resolution) resolution->error=ENOENT;
+                }
             }
         }
     }
