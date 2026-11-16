@@ -83,9 +83,22 @@ for most missing opens. This is an established file-metadata bottleneck, not
 evidence that those optional archives must be supplied. A bounded read-only path cache now avoids repeated metadata work and failed
 opens for confirmed absent files. Exact filename casing, ambiguous matches,
 mount changes and mutable-save behavior retain focused regression coverage.
-The version 0.4/code 4 update is installed; an initial run reaches Jet arcade
-attract mode at 60 FPS. Individual frontend/game-loading checks remain in
-progress, so this is not a wall-clock loading benchmark for all three games. Settings, logs and saves stay
+The version 0.5/code 5 update is installed. An earlier run reaches Jet arcade
+attract mode at 60 FPS. The updated build now passes the previously stuck
+Continue load and reaches Game Select; individual game-loading checks remain
+in progress. These checks are not a wall-clock loading benchmark for all
+three games.
+
+The FEX condition-wait wrapper previously hid its artificial 10 ms timeouts
+and immediately waited again. A notification delivered while the waiter was
+reacquiring its mutex could then be lost. The wrapper now returns a permitted
+spurious success for an artificial timeout so the guest rechecks its predicate;
+a real deadline still reports timeout. The stalled opener was waiting in
+libSceFios2, with its I/O workers also asleep in condition waits. A bounded
+regression reproduces the old FEX failure and passes with the fix, alongside
+native/FEX deadline and recursive-lock checks. See the host
+[condition-wait implementation](https://android.googlesource.com/platform/bionic/+/main/libc/bionic/pthread_cond.cpp)
+for the unregister-before-mutex-reacquisition behavior. Settings, logs and saves stay
 in primary storage.
 
 Deferred cancellation is currently consumed at safe sleep checkpoints; other
