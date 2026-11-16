@@ -9,6 +9,7 @@ int32_t runtime_guest_errno(int error) {
     switch (error) {
     case ENOENT:return 2; case EBADF:return 9; case EACCES:return 13;
     case EFAULT:return 14; case EINVAL:return 22; case EROFS:return 30;
+    case ENOTDIR:return 20;
     default:assert(!"unexpected host error");return 5;
     }
 }
@@ -109,7 +110,95 @@ static void case_sensitive_game_assets(const char *app,const char *user) {
     assert(rmdir(loading)==0 && rmdir(menu)==0 && rmdir(pair)==0 && rmdir(other_pair)==0 && rmdir(data)==0);
 }
 
+static uint64_t resolver_metadata_calls(void) {
+    return atomic_load(&file_perf[FP_EXACT_STAT].calls)+atomic_load(&file_perf[FP_COMPONENT_STAT].calls)+
+        atomic_load(&file_perf[FP_FINAL_STAT].calls)+atomic_load(&file_perf[FP_SCAN].calls);
+}
+static void cached_game_paths(const char *app) {
+    char directory[1024],alternate[1024],other[1024],path[2048],expected[2048];
+    snprintf(directory,sizeof(directory),"%s/Cache",app);
+    snprintf(alternate,sizeof(alternate),"%s/Alternate",app);
+    snprintf(other,sizeof(other),"%s/Other",app);
+    assert(mkdir(directory,0700)==0 && mkdir(alternate,0700)==0 && mkdir(other,0700)==0);
+    make_asset(directory,"existing.bin",'E');
+    make_asset(directory,"Case.bin",'A'); make_asset(directory,"case.bin",'B');
+    make_asset(alternate,"x.bin",'X'); make_asset(other,"x.bin",'Y');
+    make_asset(app,"root-key.bin",'R'); make_asset(alternate,"root-key.bin",'S');
+    const char *mode=getenv("TEMPEST_FILE_CACHE");
+    int enabled=!mode || strcmp(mode,"0");
+    GuestStat st;
+
+    expect_asset("/app0/cache/existing.bin",'E');
+    uint64_t metadata=resolver_metadata_calls(),opened=atomic_load(&file_perf[FP_OPEN].calls);
+    for (unsigned i=0;i<3;++i) expect_asset("/app0/cache/existing.bin",'E');
+    if (enabled) assert(resolver_metadata_calls()==metadata);
+    /* Successful cached paths still open real descriptors; their content is never invented. */
+    assert(atomic_load(&file_perf[FP_OPEN].calls)==opened+3);
+
+    assert(posix_open("/app0/cache/absent.dxa",0,0)==-1 && guest_errno==2);
+    metadata=resolver_metadata_calls(); opened=atomic_load(&file_perf[FP_OPEN].calls);
+    for (unsigned i=0;i<8;++i) {
+        assert(posix_open("/app0/cache/absent.dxa",0,0)==-1 && guest_errno==2);
+        assert(posix_stat("/app0/cache/absent.dxa",&st)==-1 && guest_errno==2);
+    }
+    if (enabled) {
+        assert(resolver_metadata_calls()==metadata);
+        assert(atomic_load(&file_perf[FP_OPEN].calls)==opened);
+    }
+    snprintf(expected,sizeof(expected),"%s/cache/absent.dxa",app);
+    assert(runtime_file_translate("/app0/cache/absent.dxa",path,sizeof(path))==0 && !strcmp(path,expected));
+    assert(runtime_file_translate("/app0/cache/absent.dxa",path,8)==ENAMETOOLONG);
+    assert(posix_stat("/app0/cache/absent.dxa",NULL)==-1 && guest_errno==14);
+    assert(posix_open("/app0/cache/absent.dxa",1,0)==-1 && guest_errno==30);
+    make_asset(directory,"absent.dxa",'N');
+    assert(runtime_file_mount("/app0",app)==0);
+    expect_asset("/app0/cache/absent.dxa",'N'); /* Remount expires the previously confirmed miss. */
+
+    for (unsigned i=0;i<3;++i) {
+        expect_asset("/app0/cache/Case.bin",'A');
+        assert(posix_open("/app0/cache/CASE.BIN",0,0)==-1 && guest_errno==2);
+        expect_asset("/app0/cache/case.bin",'B');
+    }
+    assert(posix_open("/app0/cache/existing.bin",0x20000,0)==-1 && guest_errno==20);
+    expect_asset("/app0/cache/existing.bin",'E'); /* O_DIRECTORY must not poison a real file. */
+    for (unsigned i=0;i<2;++i)
+        assert(posix_open("/app0/Cache/existing.bin/child",0,0)==-1 && guest_errno==20);
+    assert(posix_open("/app0/cache/../../root-key.bin",0,0)==-1 && guest_errno==13);
+
+    assert(posix_open("/app0/cache/override/x.bin",0,0)==-1 && guest_errno==2);
+    assert(runtime_file_mount("/app0/cache/override",alternate)==0);
+    expect_asset("/app0/cache/override/x.bin",'X');
+    assert(runtime_file_mount("/app0/cache/override",other)==0);
+    expect_asset("/app0/cache/override/x.bin",'Y');
+    runtime_file_unmount("/app0/cache/override");
+    assert(posix_stat("/app0/cache/override/x.bin",&st)==-1 && guest_errno==2);
+    expect_asset("/app0/root-key.bin",'R');
+    assert(runtime_file_mount("/app0",alternate)==0);
+    expect_asset("/app0/root-key.bin",'S'); expect_asset("/hostapp/root-key.bin",'R');
+    assert(runtime_file_mount("/app0",app)==0);
+    expect_asset("/app0/root-key.bin",'R');
+
+    /* Exercise bounded eviction and then resolve an earlier positive entry again. */
+    uint64_t evictions=atomic_load(&path_perf_evictions);
+    for (unsigned i=0;i<600;++i) {
+        snprintf(path,sizeof(path),"/app0/cache/evicted-%u.dxa",i);
+        assert(posix_open(path,0,0)==-1 && guest_errno==2);
+    }
+    if (enabled) assert(atomic_load(&path_perf_evictions)>evictions);
+    expect_asset("/app0/cache/existing.bin",'E');
+    snprintf(path,sizeof(path),"%s/existing.bin",directory); assert(unlink(path)==0);
+    snprintf(path,sizeof(path),"%s/Case.bin",directory); assert(unlink(path)==0);
+    snprintf(path,sizeof(path),"%s/case.bin",directory); assert(unlink(path)==0);
+    snprintf(path,sizeof(path),"%s/absent.dxa",directory); assert(unlink(path)==0);
+    snprintf(path,sizeof(path),"%s/x.bin",alternate); assert(unlink(path)==0);
+    snprintf(path,sizeof(path),"%s/x.bin",other); assert(unlink(path)==0);
+    snprintf(path,sizeof(path),"%s/root-key.bin",alternate); assert(unlink(path)==0);
+    snprintf(path,sizeof(path),"%s/root-key.bin",app); assert(unlink(path)==0);
+    assert(rmdir(directory)==0 && rmdir(alternate)==0 && rmdir(other)==0);
+}
+
 int main(void) {
+    assert(setenv("TEMPEST_FILE_PERF","1",1)==0);
     char root[480];
     const char *tmp=getenv("TMPDIR");
     snprintf(root,sizeof(root),"%s/pacman-posix-file-XXXXXX",tmp && *tmp ? tmp : "/tmp");
@@ -129,6 +218,7 @@ int main(void) {
     runtime_file_configure(app,user);
     assert(runtime_file_mount("/temp0",user)==0);
     case_sensitive_game_assets(app,user);
+    cached_game_paths(app);
     int32_t fd=posix_open("asset.bin",0,0);
     assert(fd>=3);
     char data[16]={0};

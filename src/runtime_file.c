@@ -15,6 +15,8 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <stdatomic.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #ifdef _WIN32
@@ -57,10 +59,116 @@ typedef struct { int used, host, device, flags, fdflags; Listing *dir; size_t po
 typedef struct { char guest[MOUNT_GUEST]; char host[512]; } Mount;
 static File files[MAX_FILES];
 static Mount mounts[MAX_MOUNTS];
-static size_t mount_count, opens, reads, writes, missing;
+static size_t mount_count, opens, reads, writes;
+static _Atomic size_t missing;
 static uint64_t bytes_read;
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
 static int game_path(const char *p);
+
+/* Opt-in aggregate timings; no clock or counter work on ordinary file calls.
+ * Durations overlap: resolver includes its metadata/lock work; lock hold time
+ * includes any scans. Reads include short-read recovery, with page preparation
+ * listed separately. Reporting never holds the file-table/mount mutex. */
+enum FilePerfKind {
+    FP_RESOLVE,FP_EXACT_STAT,FP_COMPONENT_STAT,FP_FINAL_STAT,FP_SCAN,FP_OPEN,FP_READ,
+    FP_READ_PREP,FP_LOCK_WAIT,FP_LOCK_HOLD,FP_MISS_LOG,FP_COUNT
+};
+typedef struct { _Atomic uint64_t calls,ns; } FilePerfTime;
+static FilePerfTime file_perf[FP_COUNT];
+static _Atomic uint64_t file_perf_hits,file_perf_entries,file_perf_final_skips,
+    file_perf_misses,file_perf_suppressed,file_perf_bytes,file_perf_next;
+static _Atomic uint64_t path_perf_positive,path_perf_negative,path_perf_misses,
+    path_perf_stores,path_perf_evictions;
+static pthread_once_t file_perf_once=PTHREAD_ONCE_INIT;
+static int file_perf_enabled;
+static _Thread_local uint64_t file_lock_started;
+static uint64_t file_perf_clock(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC,&ts)) return 0;
+    return (uint64_t)ts.tv_sec*UINT64_C(1000000000)+(uint64_t)ts.tv_nsec;
+}
+static void file_perf_init(void) {
+    const char *env=getenv("TEMPEST_FILE_PERF");
+    file_perf_enabled=env && env[0]=='1';
+    if (file_perf_enabled) atomic_store(&file_perf_next,file_perf_clock()+UINT64_C(5000000000));
+}
+static uint64_t file_perf_begin(void) {
+    int saved=errno;
+    pthread_once(&file_perf_once,file_perf_init);
+    uint64_t start=file_perf_enabled ? file_perf_clock() : 0;
+    errno=saved;
+    return start;
+}
+static void file_perf_end(enum FilePerfKind kind,uint64_t start) {
+    if (!start) return;
+    int saved=errno;
+    uint64_t end=file_perf_clock();
+    atomic_fetch_add_explicit(&file_perf[kind].calls,1,memory_order_relaxed);
+    if (end>=start) atomic_fetch_add_explicit(&file_perf[kind].ns,end-start,memory_order_relaxed);
+    errno=saved;
+}
+static void file_perf_report(int force) {
+    if (!file_perf_enabled) return;
+    int saved=errno;
+    uint64_t now=file_perf_clock(),next=atomic_load_explicit(&file_perf_next,memory_order_relaxed);
+    if ((!force && now<next) || !atomic_compare_exchange_strong(&file_perf_next,&next,now+UINT64_C(5000000000))) {
+        errno=saved; return;
+    }
+    uint64_t calls[FP_COUNT],ns[FP_COUNT],total=0;
+    for (int i=0;i<FP_COUNT;++i) {
+        calls[i]=atomic_exchange_explicit(&file_perf[i].calls,0,memory_order_relaxed);
+        ns[i]=atomic_exchange_explicit(&file_perf[i].ns,0,memory_order_relaxed);
+        total+=calls[i];
+    }
+    uint64_t hits=atomic_exchange(&file_perf_hits,0),entries=atomic_exchange(&file_perf_entries,0),
+        skips=atomic_exchange(&file_perf_final_skips,0),misses=atomic_exchange(&file_perf_misses,0),
+        suppressed=atomic_exchange(&file_perf_suppressed,0),bytes=atomic_exchange(&file_perf_bytes,0);
+    uint64_t positive=atomic_exchange(&path_perf_positive,0),negative=atomic_exchange(&path_perf_negative,0),
+        path_misses=atomic_exchange(&path_perf_misses,0),stores=atomic_exchange(&path_perf_stores,0),
+        evictions=atomic_exchange(&path_perf_evictions,0);
+    if (total) {
+        printf("File perf: resolve %llu/%.3fms; stat exact %llu/%.3fms component %llu/%.3fms final %llu/%.3fms (%llu skipped); scans %llu/%.3fms, cache hits %llu, names %llu\n",
+            (unsigned long long)calls[FP_RESOLVE],ns[FP_RESOLVE]/1e6,
+            (unsigned long long)calls[FP_EXACT_STAT],ns[FP_EXACT_STAT]/1e6,
+            (unsigned long long)calls[FP_COMPONENT_STAT],ns[FP_COMPONENT_STAT]/1e6,
+            (unsigned long long)calls[FP_FINAL_STAT],ns[FP_FINAL_STAT]/1e6,(unsigned long long)skips,
+            (unsigned long long)calls[FP_SCAN],ns[FP_SCAN]/1e6,(unsigned long long)hits,(unsigned long long)entries);
+        printf("File perf: open %llu/%.3fms; read %llu/%.3fms (%llu bytes), page prep %.3fms; file lock %llu waits %.3fms holds %.3fms; misses %llu, messages %llu/%.3fms, suppressed %llu\n",
+            (unsigned long long)calls[FP_OPEN],ns[FP_OPEN]/1e6,
+            (unsigned long long)calls[FP_READ],ns[FP_READ]/1e6,(unsigned long long)bytes,ns[FP_READ_PREP]/1e6,
+            (unsigned long long)calls[FP_LOCK_WAIT],ns[FP_LOCK_WAIT]/1e6,ns[FP_LOCK_HOLD]/1e6,
+            (unsigned long long)misses,(unsigned long long)calls[FP_MISS_LOG],ns[FP_MISS_LOG]/1e6,(unsigned long long)suppressed);
+        printf("File perf: path cache positive %llu negative %llu misses %llu stores %llu evictions %llu\n",
+            (unsigned long long)positive,(unsigned long long)negative,(unsigned long long)path_misses,
+            (unsigned long long)stores,(unsigned long long)evictions);
+    }
+    errno=saved;
+}
+static void file_lock(void) {
+    uint64_t start=file_perf_begin();
+    pthread_mutex_lock(&lock);
+    file_perf_end(FP_LOCK_WAIT,start);
+    file_lock_started=file_perf_begin();
+}
+static void file_unlock(void) {
+    uint64_t start=file_lock_started;
+    file_lock_started=0;
+    pthread_mutex_unlock(&lock);
+    file_perf_end(FP_LOCK_HOLD,start);
+    file_perf_report(0);
+}
+static int file_case_stat(const char *path,HostStat *st,enum FilePerfKind kind) {
+    uint64_t start=file_perf_begin();
+    int result=host_stat(path,st);
+    file_perf_end(kind,start);
+    return result;
+}
+static int file_host_open(const char *path,int flags,int mode) {
+    uint64_t start=file_perf_begin();
+    int result=open(path,flags,mode);
+    file_perf_end(FP_OPEN,start);
+    return result;
+}
 
 /* Read-only package names are sometimes lowercased by the guest SDK. Cache
  * only directories actually visited, never a recursive package inventory.
@@ -79,6 +187,75 @@ typedef struct {
 static CaseDirectory case_directories[CASE_CACHE_DIRS];
 static uint64_t case_cache_age;
 
+/* Exact suffixes retain the existing per-component spelling precedence. A cached negative
+ * carries the original host spelling too: public translate must still return that path.
+ * Only confirmed operation failures after complete case resolution populate negatives. */
+#define PATH_CACHE_ENTRIES 512
+typedef struct {
+    uint64_t age,generation;
+    size_t mount;
+    int error;
+    char suffix[1024],path[1024];
+} CachedPath;
+typedef struct {
+    uint64_t generation;
+    size_t mount;
+    int eligible,stable_missing,error;
+    char suffix[1024];
+} PathResolution;
+static CachedPath path_cache[PATH_CACHE_ENTRIES];
+static uint64_t path_cache_age,mount_generation=1;
+static pthread_once_t path_cache_once=PTHREAD_ONCE_INIT;
+static int path_cache_enabled;
+static void init_path_cache(void) {
+    const char *env=getenv("TEMPEST_FILE_CACHE");
+    path_cache_enabled=!env || strcmp(env,"0");
+}
+/* Called under the mount mutex for every successful mount mutation, including table moves. */
+static void invalidate_paths(void) {
+    ++mount_generation;
+    memset(path_cache,0,sizeof(path_cache)); path_cache_age=0;
+}
+static CachedPath *find_path(size_t mount,const char *suffix) {
+    for (size_t i=0;i<PATH_CACHE_ENTRIES;++i) {
+        CachedPath *entry=&path_cache[i];
+        if (entry->age && entry->generation==mount_generation && entry->mount==mount &&
+            !strcmp(entry->suffix,suffix)) {
+            entry->age=++path_cache_age;
+            if (file_perf_enabled) atomic_fetch_add_explicit(entry->error ? &path_perf_negative :
+                &path_perf_positive,1,memory_order_relaxed);
+            return entry;
+        }
+    }
+    if (file_perf_enabled) atomic_fetch_add_explicit(&path_perf_misses,1,memory_order_relaxed);
+    return NULL;
+}
+static void store_path(size_t mount,const char *suffix,const char *path,int error) {
+    if (strlen(suffix)>=sizeof(path_cache[0].suffix) || strlen(path)>=sizeof(path_cache[0].path)) return;
+    CachedPath *slot=&path_cache[0];
+    for (size_t i=0;i<PATH_CACHE_ENTRIES;++i) {
+        CachedPath *entry=&path_cache[i];
+        if (entry->age && entry->mount==mount && !strcmp(entry->suffix,suffix)) { slot=entry; break; }
+        if (entry->age<slot->age) slot=entry;
+    }
+    if (file_perf_enabled) {
+        atomic_fetch_add_explicit(&path_perf_stores,1,memory_order_relaxed);
+        if (slot->age && (slot->mount!=mount || strcmp(slot->suffix,suffix)))
+            atomic_fetch_add_explicit(&path_perf_evictions,1,memory_order_relaxed);
+    }
+    slot->age=++path_cache_age; slot->generation=mount_generation; slot->mount=mount; slot->error=error;
+    strcpy(slot->suffix,suffix); strcpy(slot->path,path);
+}
+static void remember_missing(const PathResolution *resolution,const char *path,int error) {
+    if (!resolution->eligible || !resolution->stable_missing || (error!=ENOENT && error!=ENOTDIR)) return;
+    int saved=errno;
+    file_lock();
+    /* The host operation ran outside the mount lock; do not revive an older mount mapping. */
+    if (resolution->generation==mount_generation)
+        store_path(resolution->mount,resolution->suffix,path,error);
+    file_unlock(); errno=saved;
+}
+
 static void clear_case_cache(void) {
     for (size_t i=0;i<CASE_CACHE_DIRS;++i) {
         free(case_directories[i].names);
@@ -91,13 +268,15 @@ static CaseDirectory *case_directory(const char *path) {
     for (size_t i=0;i<CASE_CACHE_DIRS;++i) {
         CaseDirectory *entry=&case_directories[i];
         if (entry->age && !strcmp(entry->path,path)) {
+            if (file_perf_enabled) atomic_fetch_add_explicit(&file_perf_hits,1,memory_order_relaxed);
             entry->age=++case_cache_age;
             return entry;
         }
         if (entry->age<slot->age) slot=entry;
     }
+    uint64_t scan_start=file_perf_begin();
     DIR *dir=opendir(path);
-    if (!dir) return NULL;
+    if (!dir) { file_perf_end(FP_SCAN,scan_start); return NULL; }
     free(slot->names);
     memset(slot,0,sizeof(*slot));
     snprintf(slot->path,sizeof(slot->path),"%s",path);
@@ -120,10 +299,12 @@ static CaseDirectory *case_directory(const char *path) {
         }
         memcpy(slot->names+slot->bytes,entry->d_name,n);
         slot->bytes+=n;
+        if (file_perf_enabled) atomic_fetch_add_explicit(&file_perf_entries,1,memory_order_relaxed);
         errno=0;
     }
     if (!entry && errno) slot->complete=0;
     closedir(dir);
+    file_perf_end(FP_SCAN,scan_start);
     /* A partial list cannot establish that a folded name is unambiguous. */
     if (!slot->complete) { free(slot->names); slot->names=NULL; slot->bytes=0; }
     return slot;
@@ -131,8 +312,9 @@ static CaseDirectory *case_directory(const char *path) {
 static unsigned char filename_fold(unsigned char c) {
     return c>='A' && c<='Z' ? (unsigned char)(c+('a'-'A')) : c;
 }
-static const char *case_name(const char *directory,const char *name,size_t length) {
+static const char *case_name(const char *directory,const char *name,size_t length,int *complete) {
     CaseDirectory *entry=case_directory(directory);
+    *complete=entry && entry->complete;
     if (!entry || !entry->complete) return NULL;
     const char *match=NULL;
     int ambiguous=0;
@@ -151,53 +333,65 @@ static const char *case_name(const char *directory,const char *name,size_t lengt
 }
 /* Leave the original normalized path untouched on a miss or ambiguity. Public
  * translate also serves callers that need the host spelling of missing paths. */
-static void case_game_path(const Mount *mount,const char *suffix,char *out,size_t size) {
+/* 1: validated existing path; -1: stable absent/ambiguous name; 0: unknown/error. */
+static int case_game_path(const Mount *mount,const char *suffix,char *out,size_t size) {
     HostStat st;
-    if (!host_stat(out,&st) || (errno!=ENOENT && errno!=ENOTDIR)) return;
+    if (!file_case_stat(out,&st,FP_EXACT_STAT)) return 1;
+    if (errno!=ENOENT && errno!=ENOTDIR) return 0;
     char resolved[CASE_CACHE_PATH];
     size_t used=strlen(mount->host);
     memcpy(resolved,mount->host,used+1);
+    int final_valid=0;
     while (*suffix) {
         ++suffix; /* Normalized suffix has one slash before each component. */
         const char *end=strchr(suffix,'/');
         size_t n=end ? (size_t)(end-suffix) : strlen(suffix);
-        if (used+n+2>sizeof(resolved)) return;
+        if (used+n+2>sizeof(resolved)) return 0;
         resolved[used]='/'; memcpy(resolved+used+1,suffix,n); resolved[used+n+1]=0;
-        if (host_stat(resolved,&st)) {
-            if (errno!=ENOENT && errno!=ENOTDIR) return;
+        final_valid=!file_case_stat(resolved,&st,FP_COMPONENT_STAT);
+        if (!final_valid) {
+            if (errno!=ENOENT && errno!=ENOTDIR) return 0;
             resolved[used]=0;
-            const char *name=case_name(resolved,suffix,n);
-            if (!name) return;
+            int complete=0;
+            const char *name=case_name(resolved,suffix,n,&complete);
+            if (!name) return complete ? -1 : 0;
             resolved[used]='/'; memcpy(resolved+used+1,name,n); resolved[used+n+1]=0;
         }
         used+=n+1;
         suffix+=n;
     }
-    if (!host_stat(resolved,&st) && used<size) memcpy(out,resolved,used+1);
+    if (final_valid) {
+        if (file_perf_enabled) atomic_fetch_add_explicit(&file_perf_final_skips,1,memory_order_relaxed);
+    } else final_valid=!file_case_stat(resolved,&st,FP_FINAL_STAT);
+    if (final_valid && used<size) { memcpy(out,resolved,used+1); return 1; }
+    return 0;
 }
 
 int runtime_file_mount(const char *guest,const char *host) {
-    pthread_mutex_lock(&lock);
+    file_lock();
     for (size_t i=0;i<mount_count;++i) if (!strcmp(mounts[i].guest,guest)) {
         if (game_path(guest)) clear_case_cache();
+        invalidate_paths();
         snprintf(mounts[i].host,sizeof(mounts[i].host),"%s",host);
-        pthread_mutex_unlock(&lock); return 0;
+        file_unlock(); return 0;
     }
-    if (mount_count==MAX_MOUNTS || strlen(guest)>=MOUNT_GUEST || strlen(host)>=512) { pthread_mutex_unlock(&lock); return -1; }
+    if (mount_count==MAX_MOUNTS || strlen(guest)>=MOUNT_GUEST || strlen(host)>=512) { file_unlock(); return -1; }
     if (game_path(guest)) clear_case_cache();
+    invalidate_paths();
     snprintf(mounts[mount_count].guest,MOUNT_GUEST,"%s",guest);
     snprintf(mounts[mount_count].host,512,"%s",host);
     ++mount_count;
-    pthread_mutex_unlock(&lock);
+    file_unlock();
     return 0;
 }
 void runtime_file_unmount(const char *guest) {
-    pthread_mutex_lock(&lock);
+    file_lock();
     for (size_t i=0;i<mount_count;++i) if (!strcmp(mounts[i].guest,guest)) {
         if (game_path(guest)) clear_case_cache();
+        invalidate_paths();
         mounts[i]=mounts[--mount_count]; break;
     }
-    pthread_mutex_unlock(&lock);
+    file_unlock();
 }
 static char user_root[512]="user";
 const char *runtime_file_user_dir(void) { return user_root; }
@@ -208,13 +402,15 @@ void runtime_file_configure(const char *app0,const char *user) {
     mkdir(user,0755);
 }
 /* Resolve a guest path to a host path; returns 0 or a host errno. */
-static int translate(const char *guest,char *out,size_t size) {
-    if (!guest || !*guest) return ENOENT;
+static int translate_resolved(const char *guest,char *out,size_t size,PathResolution *resolution) {
+    uint64_t perf_start=file_perf_begin();
+    if (resolution) memset(resolution,0,sizeof(*resolution));
+    if (!guest || !*guest) { file_perf_end(FP_RESOLVE,perf_start); return ENOENT; }
     char buffer[1024];
     int length=guest[0]!='/' ? snprintf(buffer,sizeof(buffer),"/app0/%s",guest)
                               : snprintf(buffer,sizeof(buffer),"%s",guest);
-    if (length<0 || (size_t)length>=sizeof(buffer)) return ENAMETOOLONG;
-    pthread_mutex_lock(&lock);
+    if (length<0 || (size_t)length>=sizeof(buffer)) { file_perf_end(FP_RESOLVE,perf_start); return ENAMETOOLONG; }
+    file_lock();
     size_t best=0; const Mount *m=NULL;
     for (size_t i=0;i<mount_count;++i) {
         size_t n=strlen(mounts[i].guest);
@@ -244,11 +440,35 @@ static int translate(const char *guest,char *out,size_t size) {
         }
         suffix[used]=0;
         if (!result && (size_t)snprintf(out,size,"%s%s",m->host,suffix)>=size) result=ENAMETOOLONG;
-        if (!result && game_path(m->guest)) case_game_path(m,suffix,out,size);
+        if (!result && game_path(m->guest)) {
+            pthread_once(&path_cache_once,init_path_cache);
+            size_t mount=(size_t)(m-mounts);
+            if (path_cache_enabled && resolution) {
+                resolution->eligible=1; resolution->generation=mount_generation;
+                resolution->mount=mount; strcpy(resolution->suffix,suffix);
+            }
+            CachedPath *cached=path_cache_enabled ? find_path(mount,suffix) : NULL;
+            if (cached) {
+                size_t length=strlen(cached->path);
+                if (length>=size) result=ENAMETOOLONG;
+                else {
+                    memcpy(out,cached->path,length+1);
+                    if (resolution) resolution->error=cached->error;
+                }
+            } else {
+                int status=case_game_path(m,suffix,out,size);
+                if (path_cache_enabled && status>0) store_path(mount,suffix,out,0);
+                if (resolution) resolution->stable_missing=status<0;
+            }
+        }
     }
-    pthread_mutex_unlock(&lock);
+    file_unlock();
+    file_perf_end(FP_RESOLVE,perf_start);
     if (result==ENOENT) fprintf(stderr,"Runtime: no mount for guest path %s\n",guest);
     return result;
+}
+static int translate(const char *guest,char *out,size_t size) {
+    return translate_resolved(guest,out,size,NULL);
 }
 static int host_flags(int flags) {
     int r;
@@ -359,6 +579,39 @@ static int game_path(const char *p) {
     return (!strncmp(p,"/app0",5) && (!p[5] || p[5]=='/')) ||
            (!strncmp(p,"/hostapp",8) && (!p[8] || p[8]=='/'));
 }
+/* Archive probing repeats the same missing paths thousands of times. Keep the
+ * first32 distinct game misses and one suppression notice; save/device misses
+ * remain visible. FILE_TRACE restores every line. This only changes logging. */
+static void report_missing(const char *guest) {
+    static pthread_mutex_t miss_lock=PTHREAD_MUTEX_INITIALIZER;
+    static uint64_t names[32];
+    static unsigned count;
+    static int notice;
+    ++missing;
+    if (file_perf_enabled) atomic_fetch_add_explicit(&file_perf_misses,1,memory_order_relaxed);
+    int print=1;
+    if (game_path(guest) && !file_trace()) {
+        uint64_t hash=UINT64_C(14695981039346656037);
+        for (const unsigned char *p=(const unsigned char *)guest;*p;++p)
+            hash=(hash^*p)*UINT64_C(1099511628211);
+        pthread_mutex_lock(&miss_lock);
+        for (unsigned i=0;i<count;++i) if (names[i]==hash) { print=0; break; }
+        if (print) {
+            if (count<32) names[count++]=hash;
+            else { print=notice ? 0 : 2; notice=1; }
+        }
+        pthread_mutex_unlock(&miss_lock);
+    }
+    if (print!=1 && file_perf_enabled)
+        atomic_fetch_add_explicit(&file_perf_suppressed,1,memory_order_relaxed);
+    if (print) {
+        uint64_t start=file_perf_begin();
+        if (print==1) printf("Runtime: open(%s) -> not found\n",guest);
+        else puts("Runtime: further game-file misses suppressed; TEMPEST_FILE_TRACE=1 prints every path (missing counter retained)");
+        file_perf_end(FP_MISS_LOG,start);
+    }
+    file_perf_report(0);
+}
 static int device_kind(const char *p) {
     static const struct { const char *path; int kind; } devices[]={
         {"/dev/urandom",DEV_RANDOM}, {"/dev/random",DEV_RANDOM}, {"/dev/srandom",DEV_RANDOM},
@@ -392,7 +645,7 @@ static int64_t device_read(int kind,void *buffer,uint64_t size) {
 static int64_t do_open(const char *guest,int flags,int mode) {
     int device=device_kind(guest);
     if (device) {
-        pthread_mutex_lock(&lock);
+        file_lock();
         int fd=-1;
         for (int i=3;i<MAX_FILES;++i) if (!files[i].used) { fd=i; break; }
         if (fd>=0) {
@@ -400,7 +653,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
             snprintf(files[fd].path,sizeof(files[fd].path),"%s",guest);
             ++opens;
         }
-        pthread_mutex_unlock(&lock);
+        file_unlock();
         return fd<0 ? -EMFILE : fd;
     }
     if (game_path(guest) && (flags & (3|0x8|0x200|0x400|0x800))) return -EROFS;
@@ -415,8 +668,13 @@ static int64_t do_open(const char *guest,int flags,int mode) {
         }
     }
     char path[1024];
-    int e=translate(guest,path,sizeof(path));
+    PathResolution resolution;
+    int e=translate_resolved(guest,path,sizeof(path),&resolution);
     if (e) return -e;
+    if (resolution.error) {
+        if (resolution.error==ENOENT) report_missing(guest);
+        return -resolution.error;
+    }
 #ifdef _WIN32
     /* Windows cannot open a directory as a CRT descriptor: directories are listings only. */
     (void)mode;
@@ -428,36 +686,39 @@ static int64_t do_open(const char *guest,int flags,int mode) {
         if (!(dir=list_directory(path))) return -EACCES;
     } else if (flags&0x20000) {
         e=errno==ENOENT ? ENOENT : ENOTDIR;
-        if (e==ENOENT) { ++missing; printf("Runtime: open(%s) -> not found\n",guest); }
+        remember_missing(&resolution,path,e);
+        if (e==ENOENT) report_missing(guest);
         return -e;
     } else {
-        host=open(path,host_flags(flags)&~O_DIRECTORY,_S_IREAD|_S_IWRITE);
+        host=file_host_open(path,host_flags(flags)&~O_DIRECTORY,_S_IREAD|_S_IWRITE);
         if (host<0) {
             e=errno;
-            if (e==ENOENT) { ++missing; printf("Runtime: open(%s) -> not found\n",guest); }
+            remember_missing(&resolution,path,e);
+            if (e==ENOENT) report_missing(guest);
             return -e;
         }
         if (host_fstat(host,&s)) memset(&s,0,sizeof(s));
     }
 #else
-    int host=open(path,host_flags(flags),mode ? mode : 0644);
+    int host=file_host_open(path,host_flags(flags),mode ? mode : 0644);
     if (host<0) {
         e=errno;
-        if (e==ENOENT) { ++missing; printf("Runtime: open(%s) -> not found\n",guest); }
+        remember_missing(&resolution,path,e);
+        if (e==ENOENT) report_missing(guest);
         return -e;
     }
     struct stat s;
     Listing *dir=NULL;
     if (!fstat(host,&s) && S_ISDIR(s.st_mode)) dir=list_directory(path);
 #endif
-    pthread_mutex_lock(&lock);
+    file_lock();
     int fd=-1;
     for (int i=3;i<MAX_FILES;++i) if (!files[i].used) { fd=i; break; }
-    if (fd<0) { pthread_mutex_unlock(&lock); if (host>=0) close(host); free_listing(dir); return -EMFILE; }
+    if (fd<0) { file_unlock(); if (host>=0) close(host); free_listing(dir); return -EMFILE; }
     files[fd]=(File){.used=1,.host=host,.dir=dir,.flags=flags,.fdflags=!!(flags&0x100000)};
     snprintf(files[fd].path,sizeof(files[fd].path),"%s",guest);
     ++opens;
-    pthread_mutex_unlock(&lock);
+    file_unlock();
     if (file_trace() && !game_path(guest)) {
         char frames[2048];
         runtime_guest_backtrace(frames,sizeof(frames),32);
@@ -467,14 +728,14 @@ static int64_t do_open(const char *guest,int flags,int mode) {
 }
 static int64_t do_close(int fd) {
     if (fd>=0 && fd<3) return 0;
-    pthread_mutex_lock(&lock);
+    file_lock();
     File *f=get(fd);
-    if (!f) { pthread_mutex_unlock(&lock); return -EBADF; }
+    if (!f) { file_unlock(); return -EBADF; }
     if (file_trace() && !game_path(f->path) && !f->device) printf("File trace: close(fd %d %s)\n",fd,f->path);
     if (f->host>=0) close(f->host);
     free_listing(f->dir);
     *f=(File){0};
-    pthread_mutex_unlock(&lock);
+    file_unlock();
     return 0;
 }
 static int host_fd(int fd) {
@@ -533,14 +794,20 @@ static int64_t do_read(int fd,void *buffer,uint64_t size) {
     if (device) { touch_for_write(buffer,size); return device_read(device,buffer,size); }
     int h=host_fd(fd);
     if (h<0) return -EBADF;
+    uint64_t prep_start=file_perf_begin();
     touch_for_write(buffer,size);
+    file_perf_end(FP_READ_PREP,prep_start);
     const int64_t start=host_lseek(h,0,SEEK_CUR);
     const uint64_t wait_start=runtime_wait_begin();
+    uint64_t perf_start=file_perf_begin();
     ssize_t n=host_read(h,buffer,size);
     if (start>=0 && n<(ssize_t)size) {
         n=finish_short_read(fd,h,buffer,size,start,n);
         if (n>0) host_lseek(h,start+n,SEEK_SET);
     }
+    file_perf_end(FP_READ,perf_start);
+    if (file_perf_enabled && n>0) atomic_fetch_add_explicit(&file_perf_bytes,(uint64_t)n,memory_order_relaxed);
+    file_perf_report(0);
     runtime_wait_end("file read",wait_start,"bytes",(long long)size);
     if (n<0) { if (file_trace()) printf("File trace: read(fd %d %s, %llu) failed, errno %d\n",fd,traced_path(fd),(unsigned long long)size,errno); return -errno; }
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
@@ -551,10 +818,16 @@ static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     if (device) { touch_for_write(buffer,size); return device_read(device,buffer,size); }
     int h=host_fd(fd);
     if (h<0) return -EBADF;
+    uint64_t prep_start=file_perf_begin();
     touch_for_write(buffer,size);
+    file_perf_end(FP_READ_PREP,prep_start);
     const uint64_t wait_start=runtime_wait_begin();
+    uint64_t perf_start=file_perf_begin();
     ssize_t n=pread(h,buffer,size,offset);
     if (n<(ssize_t)size) n=finish_short_read(fd,h,buffer,size,offset,n);
+    file_perf_end(FP_READ,perf_start);
+    if (file_perf_enabled && n>0) atomic_fetch_add_explicit(&file_perf_bytes,(uint64_t)n,memory_order_relaxed);
+    file_perf_report(0);
     runtime_wait_end("file pread",wait_start,"bytes",(long long)size);
     if (n<0) { if (file_trace()) printf("File trace: pread(fd %d %s, %llu @%lld) failed, errno %d\n",fd,traced_path(fd),(unsigned long long)size,(long long)offset,errno); return -errno; }
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
@@ -625,10 +898,12 @@ static int64_t do_stat(const char *guest,GuestStat *out) {
         memset(out,0,sizeof(*out)); out->mode=020777;
         return 0;
     }
-    int e=translate(guest,path,sizeof(path));
+    PathResolution resolution;
+    int e=translate_resolved(guest,path,sizeof(path),&resolution);
     if (e) return -e;
     if (!out) return -EFAULT;
-    if (host_stat(path,&s)) { e=errno; if (file_trace() && !game_path(guest)) printf("File trace: stat(%s) -> errno %d\n",guest,e); return -e; }
+    if (resolution.error) return -resolution.error;
+    if (host_stat(path,&s)) { e=errno; remember_missing(&resolution,path,e); if (file_trace() && !game_path(guest)) printf("File trace: stat(%s) -> errno %d\n",guest,e); return -e; }
     if (file_trace() && !game_path(guest)) printf("File trace: stat(%s) -> %lld bytes\n",guest,(long long)s.st_size);
     convert_stat(&s,out);
 #ifdef _WIN32
@@ -637,7 +912,7 @@ static int64_t do_stat(const char *guest,GuestStat *out) {
     return 0;
 }
 static int64_t do_getdents(int fd,char *buffer,uint64_t size,int64_t *basep) {
-    pthread_mutex_lock(&lock);
+    file_lock();
     File *f=get(fd);
     int64_t result=0;
     if (!f) result=-EBADF;
@@ -662,7 +937,7 @@ static int64_t do_getdents(int fd,char *buffer,uint64_t size,int64_t *basep) {
         }
         result=(int64_t)written;
     }
-    pthread_mutex_unlock(&lock);
+    file_unlock();
     return result;
 }
 static int64_t path_op(const char *guest,int op,int mode) {
@@ -728,9 +1003,9 @@ static int64_t do_chmod(const char *guest,uint16_t mode) {
  * but O_NONBLOCK and O_APPEND use different bits from Linux. Host descriptors
  * always stay CLOEXEC; the guest flag is independent of that host safeguard. */
 static int64_t do_fcntl(int fd,int command,int64_t argument) {
-    pthread_mutex_lock(&lock);
+    file_lock();
     File *f=get(fd);
-    if (!f) { pthread_mutex_unlock(&lock); return -EBADF; }
+    if (!f) { file_unlock(); return -EBADF; }
     int64_t result=0;
     if (command==1) result=f->fdflags; /* F_GETFD */
     else if (command==2) f->fdflags=(int)argument&1; /* F_SETFD */
@@ -752,7 +1027,7 @@ static int64_t do_fcntl(int fd,int command,int64_t argument) {
 #endif
         if (!result) f->flags=(f->flags&~(0x4|0x8))|((int)argument&(0x4|0x8));
     } else result=-EINVAL;
-    pthread_mutex_unlock(&lock);
+    file_unlock();
     return result;
 }
 
@@ -827,5 +1102,7 @@ int runtime_file_translate(const char *guest,char *out,size_t size) { return tra
 void runtime_file_report(void) {
     printf("Runtime: files opened=%zu, reads=%zu (%llu bytes), writes=%zu, not found=%zu\n",
            opens,reads,(unsigned long long)bytes_read,writes,missing);
+    (void)file_perf_begin();
+    file_perf_report(1);
 }
 

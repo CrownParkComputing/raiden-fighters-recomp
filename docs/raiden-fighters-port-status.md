@@ -74,9 +74,19 @@ manifest, ARM64 libraries, launcher icon and bundled-driver provenance pass.
 The separate app is installed on the Retroid. Its full 5,174-file game tree is
 staged in its own SD-card external-files directory, with all sizes checked and
 the prepared-image, executable and SFO hashes matched against the host.
-The installed APK is version 0.2/code 2 and its hash matches the signed build.
-Settings, logs and saves stay in primary storage. Device launch is awaiting the
-user's availability so the existing foreground app can remain undisturbed.
+Android reaches the collection title and arcade emulation on the Retroid Pocket
+Flip2, with the bundled Turnip driver and streamed audio. Loading is currently
+very slow: an uninterrupted diagnostic run spent about 65 seconds resolving
+paths and 28 seconds opening files, versus 3.4 seconds reading their contents
+over its first roughly two minutes. Repeated optional archive probes account
+for most missing opens. This is an established file-metadata bottleneck, not
+evidence that those optional archives must be supplied. A bounded read-only path cache now avoids repeated metadata work and failed
+opens for confirmed absent files. Exact filename casing, ambiguous matches,
+mount changes and mutable-save behavior retain focused regression coverage.
+The version 0.4/code 4 update is installed; an initial run reaches Jet arcade
+attract mode at 60 FPS. Individual frontend/game-loading checks remain in
+progress, so this is not a wall-clock loading benchmark for all three games. Settings, logs and saves stay
+in primary storage.
 
 Deferred cancellation is currently consumed at safe sleep checkpoints; other
 blocking POSIX wait cancellation semantics are not yet implemented. The optional

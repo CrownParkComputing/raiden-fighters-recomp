@@ -8,7 +8,8 @@ Jet, with Japanese and US variants. The supplied matching base and update have
 been inspected; the executable and bundled libraries prepare and link. Linux
 reaches player stages in all three games, with 60 FPS in steady sections and
 sustained PCM audio. These are initial gameplay checks, not full playthroughs.
-Android device runtime verification is pending. See the
+Android reaches the collection and arcade emulation on the Retroid; slow
+loading and gameplay performance remain under investigation. See the
 [current status](docs/raiden-fighters-port-status.md) for verified behavior.
 
 Android has a separate application ID, `com.crownparkcomputing.raidenfighters`.

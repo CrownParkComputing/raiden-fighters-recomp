@@ -156,6 +156,14 @@ setting with 1280x720 host output, and on-demand shader compilation. No per-titl
 intro-skip override is inherited. `launch.ini` can override the shared settings;
 normal play has no diagnostic timeout.
 
+Game mounts use a bounded cache for resolved paths and confirmed missing files.
+This avoids repeating slow SD-card metadata calls for optional archive probes;
+save and temporary mounts remain uncached. Mount changes invalidate cached
+results. For diagnostics, `TEMPEST_FILE_PERF=1` prints aggregate timings,
+`TEMPEST_FILE_CACHE=0` disables this cache, and `TEMPEST_FILE_TRACE=1` restores
+verbose missing-file messages. Ordinary runs keep duplicate game-file misses
+bounded while preserving the total missing count.
+
 The loaded procparam supplies SDK `0x05050001` for this prepared image. GPU setup
 receives the SFO ATTRIBUTE `0x800020`; CPU-mode bits 15 and 16 are both clear,
 giving mode 0. Package-tool SDK timestamps are not used as the process SDK.
