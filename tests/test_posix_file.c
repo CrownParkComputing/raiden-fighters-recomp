@@ -213,6 +213,70 @@ static void cold_snapshot_paths(const char *app) {
         fast ? "one stat for existing, zero stats/opens for absent or ambiguous" :
         enabled ? "filesystem required conservative fallback" : "cache disabled");
 }
+static void expect_host_lookup(const char *app,const char *suffix) {
+    char host_path[2048],guest_path[1024],expected=0,actual=0;
+    snprintf(host_path,sizeof(host_path),"%s%s",app,suffix);
+    snprintf(guest_path,sizeof(guest_path),"/app0%s",suffix);
+    int host=open(host_path,O_RDONLY),host_error=errno;
+    if (host>=0) assert(read(host,&expected,1)==1 && close(host)==0);
+    uint64_t exact=atomic_load(&file_perf[FP_EXACT_STAT].calls);
+    uint64_t opened=atomic_load(&file_perf[FP_OPEN].calls);
+    uint64_t negative=atomic_load(&snapshot_perf_negative);
+    int guest=posix_open(guest_path,0,0);
+    if (host>=0) {
+        assert(guest>=3 && posix_read(guest,&actual,1)==1 && actual==expected);
+        assert(posix_close(guest)==0);
+    } else assert(guest==-1 && guest_errno==runtime_guest_errno(host_error));
+    /* These are first-time full paths: delegate to the original host stat/open,
+     * whether this host recognizes the alias or treats it as an ordinary miss. */
+    assert(atomic_load(&file_perf[FP_EXACT_STAT].calls)==exact+1);
+    assert(atomic_load(&file_perf[FP_OPEN].calls)==opened+1);
+    assert(atomic_load(&snapshot_perf_negative)==negative);
+}
+static void host_alias_paths(const char *app) {
+    char root[1024],ordinary[1024],directory[1024],path[2048],suffix[1024];
+    snprintf(root,sizeof(root),"%s/HostNames",app);
+    snprintf(ordinary,sizeof(ordinary),"%s/HostNames/Ordinary",app);
+    assert(mkdir(root,0700)==0 && mkdir(ordinary,0700)==0);
+    make_asset(ordinary,"plain.bin",'P'); make_asset(ordinary,"LongFileName.bin",'L');
+    const char *directories[]={"Unicode","Dot","Space"};
+    const char *names[]={"\xE2\x84\xAA","alias.png.","alias.png "};
+    const char *aliases[]={"k","alias.png","alias.png"};
+    for (size_t i=0;i<3;++i) {
+        snprintf(directory,sizeof(directory),"%s/HostNames/%s",app,directories[i]);
+        assert(mkdir(directory,0700)==0);
+        make_asset(directory,"plain.bin",'P'); make_asset(directory,names[i],'A');
+    }
+    assert(runtime_file_mount("/app0",app)==0);
+    /* Risky request components must delegate even when their directory is ordinary. */
+    expect_host_lookup(app,"/HostNames/Ordinary/\xC3\xA9.bin");
+    expect_host_lookup(app,"/HostNames/Ordinary/plain.bin.");
+    expect_host_lookup(app,"/HostNames/Ordinary/plain.bin ");
+    expect_host_lookup(app,"/HostNames/Ordinary/LONGFI~1.BIN");
+    /* The whole suffix must be screened before an earlier component can prove absent. */
+    expect_host_lookup(app,"/HostNames/NoSuchParent/\xC3\xA9.bin");
+    for (size_t i=0;i<3;++i) {
+        /* ASCII queries also delegate when another entry may have a host alias. */
+        snprintf(suffix,sizeof(suffix),"/HostNames/%s/plain.bin",directories[i]);
+        expect_host_lookup(app,suffix);
+        snprintf(suffix,sizeof(suffix),"/HostNames/%s/%s",directories[i],aliases[i]);
+        expect_host_lookup(app,suffix);
+        snprintf(suffix,sizeof(suffix),"/HostNames/%s/absent.bin",directories[i]);
+        expect_host_lookup(app,suffix);
+    }
+    expect_host_lookup(app,"/HostNames/Unicode/\xE2\x84\xAA");
+    for (size_t i=0;i<3;++i) {
+        snprintf(directory,sizeof(directory),"%s/HostNames/%s",app,directories[i]);
+        snprintf(path,sizeof(path),"%s/plain.bin",directory); assert(unlink(path)==0);
+        snprintf(path,sizeof(path),"%s/%s",directory,names[i]); assert(unlink(path)==0);
+        assert(rmdir(directory)==0);
+    }
+    snprintf(path,sizeof(path),"%s/plain.bin",ordinary); assert(unlink(path)==0);
+    snprintf(path,sizeof(path),"%s/LongFileName.bin",ordinary); assert(unlink(path)==0);
+    assert(rmdir(ordinary)==0 && rmdir(root)==0);
+    assert(runtime_file_mount("/app0",app)==0);
+    puts("Unicode, trailing-dot/space and DOS-alias paths delegate to host stat/open");
+}
 static void cached_game_paths(const char *app) {
     char directory[1024],alternate[1024],other[1024],path[2048],expected[2048];
     snprintf(directory,sizeof(directory),"%s/Cache",app);
@@ -321,6 +385,7 @@ int main(void) {
     case_sensitive_game_assets(app,user);
     cached_game_paths(app);
     cold_snapshot_paths(app);
+    host_alias_paths(app);
     int32_t fd=posix_open("asset.bin",0,0);
     assert(fd>=3);
     char data[16]={0};

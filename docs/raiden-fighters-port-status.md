@@ -83,7 +83,7 @@ for most missing opens. This is an established file-metadata bottleneck, not
 evidence that those optional archives must be supplied. A bounded read-only path cache now avoids repeated metadata work and failed
 opens for confirmed absent files. Exact filename casing, ambiguous matches,
 mount changes and mutable-save behavior retain focused regression coverage.
-The version 0.6/code 6 update is installed. Version 0.5 passed the previously
+The version 0.7/code 7 update is installed. Version 0.5 passed the previously
 stuck Continue load, reached Game Select, and entered a Raiden Fighters player
 stage at 60 FPS. An earlier run reached Jet arcade attract mode at 60 FPS.
 Individual game-switching checks remain in progress.
@@ -91,11 +91,16 @@ Individual game-switching checks remain in progress.
 Cold lookups now use complete searchable directory snapshots, retaining exact
 spelling and rejecting ambiguous folded matches. Unknown entry types, symlinks,
 permission limitations and incomplete listings fall back to the original
-resolver. Existing files still use real stat/open descriptors; save mounts
+resolver. Unicode, trailing-dot/space and DOS-style name aliases also retain
+the host lookup path. A separate SD-card check confirmed that a lowercase
+Unicode query opens its uppercase-named file through this fallback. Existing files still use real stat/open descriptors; save mounts
 remain uncached. On the Retroid, the same 240 existing paths plus 960 distinct
 recorded misses took 33.74 seconds through the version 0.5 resolver and 5.24
 seconds through version 0.6, with all results matching. This read-only file
 benchmark does not measure full game startup or every gameplay transition.
+A separate device probe opened all 5,174 staged files using their original
+names, with no lookup mismatches. The focused file and FEX condition fixtures
+also pass against Android's actual libc in an isolated temporary directory.
 
 The FEX condition-wait wrapper previously hid its artificial 10 ms timeouts
 and immediately waited again. A notification delivered while the waiter was

@@ -148,7 +148,7 @@ static void file_perf_report(int force) {
         printf("File perf: path cache positive %llu negative %llu misses %llu stores %llu evictions %llu\n",
             (unsigned long long)positive,(unsigned long long)negative,(unsigned long long)path_misses,
             (unsigned long long)stores,(unsigned long long)evictions);
-        printf("File perf: cold snapshots positive %llu negative %llu fallback %llu (unknown type %llu special/non-dir %llu access/incomplete %llu); directories eligible %llu rejected %llu\n",
+        printf("File perf: cold snapshots positive %llu negative %llu fallback %llu (unknown type %llu special/non-dir %llu access/incomplete/alias %llu); directories eligible %llu rejected %llu\n",
             (unsigned long long)snap_positive,(unsigned long long)snap_negative,(unsigned long long)fallback,
             (unsigned long long)unknown,(unsigned long long)special,(unsigned long long)unusable,
             (unsigned long long)eligible_dirs,(unsigned long long)rejected_dirs);
@@ -193,7 +193,7 @@ typedef struct {
     char *names;
     size_t bytes;
     uint64_t age;
-    int complete,searchable;
+    int complete,searchable,ordinary_names;
 } CaseDirectory;
 enum { CASE_UNKNOWN,CASE_REGULAR,CASE_DIRECTORY,CASE_SPECIAL };
 static CaseDirectory case_directories[CASE_CACHE_DIRS];
@@ -275,6 +275,12 @@ static void clear_case_cache(void) {
     }
     case_cache_age=0;
 }
+/* Let the host resolve Unicode folds and trailing-dot/space aliases. */
+static int ordinary_name(const char *name,size_t length) {
+    if (!length || name[length-1]=='.' || name[length-1]==' ') return 0;
+    for (size_t i=0;i<length;++i) if ((unsigned char)name[i]>=0x80) return 0;
+    return 1;
+}
 static int searchable_directory(DIR *directory) {
 #ifdef _WIN32
     (void)directory;
@@ -307,12 +313,14 @@ static CaseDirectory *case_directory(const char *path) {
     slot->age=++case_cache_age;
     slot->complete=1;
     slot->searchable=path_cache_enabled && searchable_directory(dir);
+    slot->ordinary_names=1;
     size_t capacity=0,name_bytes=0;
     struct dirent *entry;
     errno=0;
     while ((entry=readdir(dir))) {
         if (!strcmp(entry->d_name,".") || !strcmp(entry->d_name,"..")) continue;
         size_t n=strlen(entry->d_name)+2; /* dirent kind byte, then NUL-terminated name */
+        if (!ordinary_name(entry->d_name,n-2)) slot->ordinary_names=0;
         /* Keep the original filename-byte limit, including in cache-off mode.
          * Type metadata uses at most one extra byte per two filename bytes. */
         if (n-1>CASE_CACHE_NAMES-name_bytes) { slot->complete=0; break; }
@@ -341,7 +349,7 @@ static CaseDirectory *case_directory(const char *path) {
     /* A partial list cannot establish that a folded name is unambiguous. */
     if (!slot->complete) { free(slot->names); slot->names=NULL; slot->bytes=0; }
     if (file_perf_enabled && path_cache_enabled)
-        atomic_fetch_add_explicit(slot->complete && slot->searchable ? &snapshot_perf_eligible_dirs :
+        atomic_fetch_add_explicit(slot->complete && slot->searchable && slot->ordinary_names ? &snapshot_perf_eligible_dirs :
             &snapshot_perf_rejected_dirs,1,memory_order_relaxed);
     return slot;
 }
@@ -349,10 +357,11 @@ static unsigned char filename_fold(unsigned char c) {
     return c>='A' && c<='Z' ? (unsigned char)(c+('a'-'A')) : c;
 }
 static const char *case_name_kind(const char *directory,const char *name,size_t length,
-                                   int *complete,int *searchable,unsigned char *kind) {
+                                   int *complete,int *searchable,int *ordinary,unsigned char *kind) {
     CaseDirectory *entry=case_directory(directory);
     *complete=entry && entry->complete;
     if (searchable) *searchable=entry && entry->searchable;
+    if (ordinary) *ordinary=entry && entry->ordinary_names;
     if (!entry || !entry->complete) return NULL;
     const char *match=NULL;
     unsigned char match_kind=CASE_UNKNOWN;
@@ -373,21 +382,29 @@ static const char *case_name_kind(const char *directory,const char *name,size_t 
     return ambiguous ? NULL : match;
 }
 static const char *case_name(const char *directory,const char *name,size_t length,int *complete) {
-    return case_name_kind(directory,name,length,complete,NULL,NULL);
+    return case_name_kind(directory,name,length,complete,NULL,NULL,NULL);
 }
 /* Cold lookup using only complete, searchable directory snapshots. Known directory entry
  * types let us avoid per-component stats; a positive leaf still gets one real stat. */
 static int snapshot_game_path(const Mount *mount,const char *suffix,char *out,size_t size) {
     if (!*suffix) return 0;
+    /* Preflight the whole request before an earlier absent component could short-circuit.
+     * Tildes may denote DOS short-name aliases even in otherwise ordinary directories. */
+    for (const char *component=suffix;*component;) {
+        const char *start=++component;
+        while (*component && *component!='/') ++component;
+        size_t length=(size_t)(component-start);
+        if (!ordinary_name(start,length) || memchr(start,'~',length)) return 0;
+    }
     char resolved[CASE_CACHE_PATH]; size_t used=strlen(mount->host);
     memcpy(resolved,mount->host,used+1);
     while (*suffix) {
         ++suffix;
         const char *end=strchr(suffix,'/');
         size_t n=end ? (size_t)(end-suffix) : strlen(suffix);
-        int complete=0,searchable=0; unsigned char kind=CASE_UNKNOWN;
-        const char *name=case_name_kind(resolved,suffix,n,&complete,&searchable,&kind);
-        if (!complete || !searchable) {
+        int complete=0,searchable=0,ordinary=0; unsigned char kind=CASE_UNKNOWN;
+        const char *name=case_name_kind(resolved,suffix,n,&complete,&searchable,&ordinary,&kind);
+        if (!complete || !searchable || !ordinary) {
             if (file_perf_enabled) atomic_fetch_add_explicit(&snapshot_perf_unusable,1,memory_order_relaxed);
             return 0;
         }
